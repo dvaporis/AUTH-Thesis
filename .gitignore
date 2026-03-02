@@ -1,0 +1,49 @@
+# Dataset directories
+kaggle_datasets/
+.cache/
+**/.cache/
+
+# Results and outputs
+audio_encodec_results/
+video_encodec_results/
+videomae_results/
+av_hubert_results/
+
+# Python environment
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Large model files
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Temporary files
+*.tmp
+*.log
