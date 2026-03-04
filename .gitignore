@@ -9,6 +9,7 @@ video_encodec_results/
 videomae_results/
 av_hubert_results/
 aligned_results/
+audio_contrastive_results/
 
 # Python environment
 .venv/
@@ -48,5 +49,3 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.log
-
-.gitignore
