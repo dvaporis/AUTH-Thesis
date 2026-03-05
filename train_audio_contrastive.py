@@ -45,14 +45,16 @@ logger = logging.getLogger(__name__)
 class AudioConfig:
     """Configuration for audio processing."""
     sample_rate: int = 48000  # EnCodec 48kHz stereo
-    num_samples: int = 25600  # ~16 video frames at 30fps
+    num_video_frames: int = 16  # target bite length in video frames
+    reference_video_fps: float = 30.0  # fallback fps when exact fps is unavailable
+    num_samples: Optional[int] = None  # derived from frames/fps if None
     overlap: float = 0.5  # 50% overlap
-    stride: int = 12800  # samples (50% of num_samples)
+    stride: Optional[int] = None  # derived from overlap if None
     num_channels: int = 2  # stereo
-    
+
     # EnCodec config
     encodec_bandwidth: float = 6.0  # kbps
-    
+
     # Augmentation parameters
     noise_level_db: float = 20.0  # SNR for additive noise (signal 100x stronger than noise)
     impulse_prob: float = 0.1
@@ -60,6 +62,12 @@ class AudioConfig:
     stretch_range: Tuple[float, float] = (0.9, 1.1)  # Time stretching range
     phase_shift_range: Tuple[float, float] = (-np.pi, np.pi)
     mixup_alpha: float = 0.3  # For manifold mixup
+
+    def __post_init__(self):
+        if self.num_samples is None:
+            self.num_samples = int(round(self.sample_rate * self.num_video_frames / self.reference_video_fps))
+        if self.stride is None:
+            self.stride = int(round(self.num_samples * (1.0 - self.overlap)))
 
 
 @dataclass
@@ -497,7 +505,8 @@ class AudioContrastiveModel(nn.Module):
         
         # Determine encoder output dimension by running a dummy forward pass
         with torch.no_grad():
-            dummy_audio = torch.randn(1, 2, 25600)
+            dummy_num_samples = AudioConfig().num_samples
+            dummy_audio = torch.randn(1, 2, dummy_num_samples)
             if self.use_hf_encodec:
                 # HuggingFace version - use encoder directly for continuous embeddings
                 # Returns [batch, channels, time]
@@ -714,7 +723,7 @@ def extract_audio_from_video(video_path: Path, target_sr: int = 48000) -> Tuple[
 
 
 def find_kaggle_audio_files() -> List[Path]:
-    """Find all audio/video files in Kaggle dataset (prioritizes MP4 videos with embedded audio)."""
+    """Find video files (01-*.mp4) from Kaggle dataset - extracts audio from videos only."""
     import os
     
     possible_paths = [
@@ -723,28 +732,27 @@ def find_kaggle_audio_files() -> List[Path]:
         Path(os.environ.get("USERPROFILE", "~")) / ".cache/kagglehub/datasets",
     ]
     
-    audio_files = []
+    video_files = []
     
     for kaggle_path in possible_paths:
         if kaggle_path.exists():
-            # First try to find video files (preferred - embedded audio)
+            # Find video files starting with "01-" (speech videos with audio)
             video_extensions = ['.mp4', '.avi', '.mov', '.mkv']
-            video_files = []
+            all_videos = []
             for ext in video_extensions:
-                video_files.extend(kaggle_path.rglob(f"*{ext}"))
+                all_videos.extend(kaggle_path.rglob(f"*{ext}"))
+            
+            # Filter to only "01-" prefix (speech videos with embedded audio)
+            video_files = [v for v in all_videos if v.name.startswith('01-')]
             
             if video_files:
-                logger.info(f"Found {len(video_files)} video files (will extract audio) in {kaggle_path}")
-                audio_files = video_files
-                break
-            
-            # Fallback to WAV files if no videos found
-            audio_files = list(kaggle_path.rglob("*.wav"))
-            if audio_files:
-                logger.info(f"Found {len(audio_files)} .wav files in {kaggle_path}")
+                logger.info(f"Found {len(video_files)} speech video files (01-*.mp4, will extract audio) in {kaggle_path}")
                 break
     
-    return audio_files
+    if not video_files:
+        logger.warning("No video files with '01-' prefix found! Ensure Kaggle dataset is downloaded.")
+    
+    return video_files
 
 
 def split_dataset(audio_files: List[Path], train_ratio: float = 0.6, val_ratio: float = 0.2, test_ratio: float = 0.2, seed: int = 42) -> Tuple[List[Path], List[Path], List[Path]]:

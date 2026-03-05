@@ -1,12 +1,13 @@
-from train_audio_contrastive import AudioContrastiveModel, TrainingConfig, ContrastiveLoss
+from train_audio_contrastive import AudioContrastiveModel, TrainingConfig, ContrastiveLoss, AudioConfig
 import torch
 
 config = TrainingConfig()
+audio_config = AudioConfig()
 print('Creating model...')
 model = AudioContrastiveModel(config)
 print('[OK] Model created successfully')
 
-dummy_audio = torch.randn(2, 2, 25600)
+dummy_audio = torch.randn(2, 2, audio_config.num_samples)
 print('Testing forward pass...')
 output = model(dummy_audio)
 print(f'[OK] Output shape: {output.shape}')

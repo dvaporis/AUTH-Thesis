@@ -34,69 +34,61 @@ logger = logging.getLogger(__name__)
 
 
 def find_kaggle_audio_files(kaggle_dir: str = "kaggle_datasets") -> list:
-    """
-    Find all audio/video files in the Kaggle dataset directory.
-    Prioritizes MP4 video files with embedded audio.
-    
-    Args:
-        kaggle_dir: Root directory of Kaggle dataset
-        
-    Returns:
-        List of audio/video file paths
-    """
+    """Find video files (01-*.mp4) from Kaggle dataset - extracts audio from videos only."""
     import os
     
-    # Check multiple possible locations
     possible_paths = [
         Path(kaggle_dir),
         Path(os.path.expanduser("~/.cache/kagglehub/datasets")),
         Path(os.environ.get("USERPROFILE", "~")) / ".cache/kagglehub/datasets",
     ]
     
-    audio_files = []
+    video_files = []
     
     for kaggle_path in possible_paths:
         if kaggle_path.exists():
-            # First try to find video files (preferred - embedded audio)
-            video_extensions = {'.mp4', '.avi', '.mov', '.mkv'}
+            # Find video files starting with "01-" (speech videos with audio)
+            video_extensions = ['.mp4', '.avi', '.mov', '.mkv']
+            all_videos = []
             for ext in video_extensions:
-                video_files = list(kaggle_path.rglob(f"*{ext}"))
-                audio_files.extend(video_files)
+                all_videos.extend(kaggle_path.rglob(f"*{ext}"))
             
-            if audio_files:
-                logger.info(f"Found {len(audio_files)} video files (will extract audio) in {kaggle_path}")
-                break
+            # Filter to only "01-" prefix (speech videos with embedded audio)
+            video_files = [v for v in all_videos if v.name.startswith('01-')]
             
-            # Fallback to audio files
-            audio_extensions = {'.wav', '.mp3', '.flac', '.ogg', '.m4a'}
-            for file in kaggle_path.rglob("*"):
-                if file.suffix.lower() in audio_extensions:
-                    audio_files.append(file)
-            
-            if audio_files:
-                logger.info(f"Found {len(audio_files)} audio files in {kaggle_path}")
+            if video_files:
+                logger.info(f"Found {len(video_files)} speech video files (01-*.mp4, will extract audio) in {kaggle_path}")
                 break
     
-    return audio_files
+    if not video_files:
+        logger.warning("No video files with '01-' prefix found! Ensure Kaggle dataset is downloaded.")
+    
+    return video_files
 
 
-def load_or_create_audio(audio_path: Optional[str] = None, duration: float = 5.0, 
-                         sample_rate: int = 48000, num_samples: int = 25600) -> Tuple[torch.Tensor, int, float, str]:
+def load_or_create_audio(audio_path: Optional[str] = None, duration: float = 5.0,
+                         sample_rate: int = 48000, num_samples: Optional[int] = None,
+                         num_video_frames: int = 16) -> Tuple[torch.Tensor, int, float, str]:
     """
     Load audio from audio/video file or create a test signal.
     Supports extracting audio from MP4 videos using PyAV.
-    Extracts exactly num_samples without padding (matching video encoder approach).
+    Extracts a frame-aligned sample count for video files using actual FPS:
+    samples = round(num_video_frames / fps * sample_rate).
     
     Args:
         audio_path: Path to audio/video file (optional)
         duration: Duration of test signal in seconds
         sample_rate: Sample rate in Hz
-        num_samples: Number of samples to extract (default 25600 ≈ 16 frames at 30fps at 48kHz)
+        num_samples: Optional explicit sample count override
+        num_video_frames: Number of video frames represented by each audio bite
     
     Returns:
         Tuple of (waveform, sample_rate, duration_seconds, source_description)
         where duration_seconds is the actual duration of the extracted samples
     """
+    default_samples = int(round(sample_rate * num_video_frames / 30.0))
+    target_num_samples = num_samples if num_samples is not None else default_samples
+
     if audio_path and Path(audio_path).exists():
         logger.info(f"Loading audio from: {audio_path}")
         file_path = Path(audio_path)
@@ -107,6 +99,27 @@ def load_or_create_audio(audio_path: Optional[str] = None, duration: float = 5.0
                 # Extract audio from video using PyAV
                 logger.info(f"Extracting audio from video file...")
                 container = av.open(str(audio_path))
+
+                # Derive sample count from actual video fps for exact frame alignment
+                video_fps = None
+                video_stream = container.streams.video[0] if container.streams.video else None
+                if video_stream:
+                    if video_stream.average_rate is not None:
+                        video_fps = float(video_stream.average_rate)
+                    elif video_stream.base_rate is not None:
+                        video_fps = float(video_stream.base_rate)
+
+                if video_fps and video_fps > 0:
+                    target_num_samples = int(round(sample_rate * num_video_frames / video_fps))
+                    logger.info(
+                        f"Frame-aligned extraction: {num_video_frames} frames @ {video_fps:.3f} fps "
+                        f"=> {target_num_samples} samples"
+                    )
+                else:
+                    logger.warning(
+                        f"Could not determine video FPS, using fallback {target_num_samples} samples "
+                        f"(~{num_video_frames} frames @ 30fps)"
+                    )
                 
                 audio_stream = container.streams.audio[0] if container.streams.audio else None
                 if not audio_stream:
@@ -194,15 +207,21 @@ def load_or_create_audio(audio_path: Optional[str] = None, duration: float = 5.0
                 logger.info(f"Trimming audio to 30 seconds...")
                 waveform = waveform[:, :max_samples]
             
-            # Extract exactly num_samples (no padding, matching video encoder)
-            if waveform.shape[1] > num_samples:
-                logger.info(f"Extracting {num_samples} samples ({num_samples}/{sample_rate}={num_samples/sample_rate:.3f}s)...")
+            # Extract frame-aligned target samples
+            if waveform.shape[1] > target_num_samples:
+                logger.info(
+                    f"Extracting {target_num_samples} samples "
+                    f"({target_num_samples/sample_rate:.3f}s target duration)..."
+                )
                 # Take a random segment from the audio
-                max_start = waveform.shape[1] - num_samples
+                max_start = waveform.shape[1] - target_num_samples
                 start_idx = random.randint(0, max_start) if max_start > 0 else 0
-                waveform = waveform[:, start_idx:start_idx + num_samples]
+                waveform = waveform[:, start_idx:start_idx + target_num_samples]
             else:
-                logger.warning(f"Audio shorter than {num_samples} samples ({waveform.shape[1]} available)")
+                logger.warning(
+                    f"Audio shorter than target bite ({target_num_samples} samples, "
+                    f"{waveform.shape[1]} available)"
+                )
             
             # Calculate actual duration based on extracted samples
             actual_duration = waveform.shape[1] / sample_rate
@@ -252,11 +271,11 @@ def load_or_create_audio(audio_path: Optional[str] = None, duration: float = 5.0
         signal = signal / np.max(np.abs(signal)) * 0.95
         waveform = torch.FloatTensor(signal).unsqueeze(0)
     
-    # Extract only num_samples if available
-    if waveform.shape[1] > num_samples:
-        max_start = waveform.shape[1] - num_samples
+    # Extract only target_num_samples if available
+    if waveform.shape[1] > target_num_samples:
+        max_start = waveform.shape[1] - target_num_samples
         start_idx = random.randint(0, max_start)
-        waveform = waveform[:, start_idx:start_idx + num_samples]
+        waveform = waveform[:, start_idx:start_idx + target_num_samples]
     
     # Calculate actual duration
     actual_duration = waveform.shape[1] / sample_rate
@@ -318,31 +337,36 @@ def compute_error_metrics(original: torch.Tensor, reconstructed: torch.Tensor) -
     return metrics
 
 
-def test_encodec_with_audio(audio_path: Optional[str] = None, use_kaggle: bool = False):
+def test_encodec_with_audio(audio_path: Optional[str] = None, use_kaggle: bool = False,
+                            num_video_frames: int = 16):
     """
     Test EnCodec encoder-decoder with real or generated audio.
     
     Args:
         audio_path: Path to audio file (optional)
         use_kaggle: Whether to use a random file from Kaggle dataset
+        num_video_frames: Number of video frames represented by each audio bite
     """
     logger.info("="*70)
-    logger.info("Testing EnCodec Audio Codec (Fixed Sample Count)")
+    logger.info(f"Testing EnCodec Audio Codec (Frame-Aligned: {num_video_frames} video frames)")
     logger.info("="*70)
     
     # Determine audio to test
     if use_kaggle:
         kaggle_files = find_kaggle_audio_files()
         if not kaggle_files:
-            logger.error("No audio files found in Kaggle dataset!")
             logger.info("Run: python download_kaggle_dataset.py")
             raise FileNotFoundError("Kaggle dataset not found or empty")
         
         audio_path = str(random.choice(kaggle_files))
         logger.info(f"Using random Kaggle audio: {audio_path}")
     
-    # Load audio (extracts fixed num_samples, no padding)
-    waveform, sample_rate, duration_seconds, source_desc = load_or_create_audio(audio_path)
+    # Load audio
+    waveform, sample_rate, duration_seconds, source_desc = load_or_create_audio(
+        audio_path,
+        num_video_frames=num_video_frames
+    )
+    
     logger.info(f"Audio shape: {waveform.shape}, Sample rate: {sample_rate}Hz")
     logger.info(f"Duration: {duration_seconds:.3f} seconds")
     logger.info(f"Source: {source_desc}")
@@ -547,13 +571,16 @@ if __name__ == "__main__":
                        help="Use a random audio file from Kaggle dataset")
     parser.add_argument("--duration", type=float, default=5.0,
                        help="Duration for generated test signal")
+    parser.add_argument("--num-video-frames", type=int, default=16,
+                       help="Number of video frames represented by each audio bite")
     
     args = parser.parse_args()
     
     try:
         metrics = test_encodec_with_audio(
             audio_path=args.audio,
-            use_kaggle=args.use_kaggle
+            use_kaggle=args.use_kaggle,
+            num_video_frames=args.num_video_frames
         )
         logger.info("\n" + "="*70)
         logger.info("✓ EnCodec test completed successfully!")
