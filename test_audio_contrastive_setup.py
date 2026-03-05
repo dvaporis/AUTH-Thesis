@@ -71,7 +71,8 @@ def test_augmentation():
     audio_config = AudioConfig()
     t = np.linspace(0, audio_config.num_samples / audio_config.sample_rate, audio_config.num_samples)
     audio_np = np.sin(2 * np.pi * 440 * t)  # 440 Hz sine wave
-    audio = torch.from_numpy(audio_np).unsqueeze(0).float()
+    stereo_np = np.stack([audio_np, audio_np], axis=0)
+    audio = torch.from_numpy(stereo_np).float()
     
     augmentation = AudioAugmentation(audio_config)
     
@@ -145,7 +146,7 @@ def test_model_forward():
     # Create dummy batch
     batch_size = 8
     audio_config = AudioConfig()
-    dummy_audio = torch.randn(batch_size, 1, audio_config.num_samples).to(device)
+    dummy_audio = torch.randn(batch_size, audio_config.num_channels, audio_config.num_samples).to(device)
     
     # Test forward pass
     try:

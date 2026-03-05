@@ -5,9 +5,9 @@ This implementation provides a complete pipeline for training contrastive learni
 ## Features
 
 ### Architecture
-- **Frozen EnCodec Encoder**: Pre-trained Meta EnCodec (24kHz) for feature extraction
+- **Frozen EnCodec Encoder**: Pre-trained Meta EnCodec (48kHz stereo) for feature extraction
 - **Trainable Projection Head**: 3-layer MLP with batch normalization and dropout
-- **Overlapping Audio Chunks**: 50% overlap (12,800 samples per chunk, 6,400 sample stride)
+- **Overlapping Audio Chunks**: 50% overlap (25,600 samples per chunk, 12,800 sample stride)
 
 ### Contrastive Learning Objective
 
@@ -52,9 +52,9 @@ The following augmentation techniques are implemented:
 ### Dataset Configuration
 
 - **Train/Val/Test Split**: 60% / 20% / 20%
-- **Audio Format**: 24kHz sample rate, mono
-- **Chunk Size**: 12,800 samples (~0.533s, equivalent to 16 video frames at 30fps)
-- **Overlap**: 50% (6,400 samples stride)
+- **Audio Format**: 48kHz sample rate, stereo (2 channels)
+- **Chunk Size**: 25,600 samples (~0.533s, equivalent to 16 video frames at 30fps)
+- **Overlap**: 50% (12,800 samples stride)
 
 ## Installation
 
@@ -155,10 +155,10 @@ The training script creates the following outputs in the `output-dir`:
 
 ### AudioConfig
 ```python
-sample_rate: 24000          # EnCodec default
-num_samples: 12800          # ~16 video frames
-overlap: 0.5                # 50% overlap
-stride: 6400                # samples (50% of num_samples)
+sample_rate: 48000          # EnCodec 48kHz stereo
+num_samples: 25600          # ~16 video frames
+overlapfloat = 0.5                # 50% overlap
+stride: 12800               # samples (50% of num_samples)
 encodec_bandwidth: 6.0      # kbps
 ```
 

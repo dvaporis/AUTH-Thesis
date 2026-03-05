@@ -136,7 +136,7 @@ def extract_aligned_video_audio(
     audio_path: str,
     num_frames: int = 16,
     start_time: Optional[float] = None,
-    target_audio_sr: int = 24000
+    target_audio_sr: int = 48000
 ) -> Tuple[np.ndarray, torch.Tensor, Dict[str, float]]:
     """
     Extract temporally-aligned video frames and audio from separate files.
@@ -263,10 +263,13 @@ def extract_aligned_video_audio(
         logger.info(f"  Total samples: {waveform.shape[1]}")
         logger.info(f"  Duration: {waveform.shape[1]/sample_rate:.2f}s")
         
-        # Convert stereo to mono if needed
-        if waveform.shape[0] > 1:
-            logger.info(f"  Converting stereo to mono")
-            waveform = waveform.mean(dim=0, keepdim=True)
+        # Preserve stereo for 48kHz workflow
+        if waveform.shape[0] == 1:
+            logger.info(f"  Padding mono to stereo")
+            waveform = waveform.repeat(2, 1)
+        elif waveform.shape[0] > 2:
+            logger.info(f"  Truncating {waveform.shape[0]} channels to stereo")
+            waveform = waveform[:2, :]
         
         # Resample if needed
         if sample_rate != target_audio_sr:
@@ -301,7 +304,7 @@ def extract_aligned_video_audio(
         logger.warning(f"Could not extract audio: {e}")
         logger.info("Creating silent audio placeholder...")
         num_samples = int(chunk_duration * target_audio_sr)
-        audio_segment = torch.zeros(1, num_samples)
+        audio_segment = torch.zeros(2, num_samples)
         sample_rate = target_audio_sr
         start_sample = 0
     

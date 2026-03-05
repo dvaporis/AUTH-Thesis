@@ -66,7 +66,7 @@ def find_kaggle_audio_files(kaggle_dir: str = "kaggle_datasets") -> list:
 
 
 def load_or_create_audio(audio_path: Optional[str] = None, duration: float = 5.0, 
-                         sample_rate: int = 24000, num_samples: int = 12800) -> Tuple[torch.Tensor, int, float, str]:
+                         sample_rate: int = 48000, num_samples: int = 25600) -> Tuple[torch.Tensor, int, float, str]:
     """
     Load audio file or create a test signal.
     Extracts exactly num_samples without padding (matching video encoder approach).
@@ -75,7 +75,7 @@ def load_or_create_audio(audio_path: Optional[str] = None, duration: float = 5.0
         audio_path: Path to audio file (optional)
         duration: Duration of test signal in seconds
         sample_rate: Sample rate in Hz
-        num_samples: Number of samples to extract (default 12800 ≈ 16 frames at 30fps at 24kHz)
+        num_samples: Number of samples to extract (default 25600 ≈ 16 frames at 30fps at 48kHz)
     
     Returns:
         Tuple of (waveform, sample_rate, duration_seconds, source_description)
@@ -106,10 +106,20 @@ def load_or_create_audio(audio_path: Optional[str] = None, duration: float = 5.0
                 resampler = torchaudio.transforms.Resample(sr, sample_rate)
                 waveform = resampler(waveform)
             
-            # If stereo, convert to mono for consistency
-            if waveform.shape[0] > 1:
-                logger.info(f"Converting stereo to mono ({waveform.shape[0]} channels)")
-                waveform = waveform.mean(dim=0, keepdim=True)
+            # Preserve stereo for 48kHz model, convert to mono for 24kHz
+            if sample_rate == 48000:
+                # Preserve stereo (pad mono to stereo, truncate >2 channels to 2)
+                if waveform.shape[0] == 1:
+                    logger.info("Padding mono to stereo")
+                    waveform = waveform.repeat(2, 1)
+                elif waveform.shape[0] > 2:
+                    logger.info(f"Truncating {waveform.shape[0]} channels to stereo")
+                    waveform = waveform[:2, :]
+            else:
+                # Convert to mono for 24kHz
+                if waveform.shape[0] > 1:
+                    logger.info(f"Converting stereo to mono ({waveform.shape[0]} channels)")
+                    waveform = waveform.mean(dim=0, keepdim=True)
             
             # Limit duration if too long
             max_samples = int(sample_rate * 30)  # 30 second max
@@ -142,17 +152,38 @@ def load_or_create_audio(audio_path: Optional[str] = None, duration: float = 5.0
     num_full_samples = int(duration * sample_rate)
     t = np.arange(num_full_samples) / sample_rate
     
-    # Combination of sine waves
-    signal = (
-        0.3 * np.sin(2 * np.pi * 440 * t) +  # A4 note
-        0.2 * np.sin(2 * np.pi * 880 * t) +  # A5 note
-        0.15 * np.sin(2 * np.pi * 220 * t) +  # A3 note
-        0.1 * np.random.randn(num_full_samples)  # Noise
-    )
+    # Determine channels based on sample rate
+    channels = 2 if sample_rate == 48000 else 1
     
-    # Normalize
-    signal = signal / np.max(np.abs(signal)) * 0.95
-    waveform = torch.FloatTensor(signal).unsqueeze(0)
+    if channels == 2:
+        # Create stereo signal with phase-shifted channels
+        left = (
+            0.3 * np.sin(2 * np.pi * 440 * t) +  # A4 note
+            0.2 * np.sin(2 * np.pi * 880 * t) +  # A5 note
+            0.15 * np.sin(2 * np.pi * 220 * t) +  # A3 note
+            0.1 * np.random.randn(num_full_samples)  # Noise
+        )
+        right = (
+            0.3 * np.sin(2 * np.pi * 440.1 * t) +  # Slightly detuned
+            0.2 * np.sin(2 * np.pi * 880.05 * t) +
+            0.15 * np.sin(2 * np.pi * 220.15 * t) +
+            0.1 * np.random.randn(num_full_samples)
+        )
+        # Normalize
+        left = left / np.max(np.abs(left)) * 0.95
+        right = right / np.max(np.abs(right)) * 0.95
+        waveform = torch.FloatTensor(np.stack([left, right], axis=0))
+    else:
+        # Mono signal
+        signal = (
+            0.3 * np.sin(2 * np.pi * 440 * t) +  # A4 note
+            0.2 * np.sin(2 * np.pi * 880 * t) +  # A5 note
+            0.15 * np.sin(2 * np.pi * 220 * t) +  # A3 note
+            0.1 * np.random.randn(num_full_samples)  # Noise
+        )
+        # Normalize
+        signal = signal / np.max(np.abs(signal)) * 0.95
+        waveform = torch.FloatTensor(signal).unsqueeze(0)
     
     # Extract only num_samples if available
     if waveform.shape[1] > num_samples:
@@ -265,7 +296,9 @@ def test_encodec_with_audio(audio_path: Optional[str] = None, use_kaggle: bool =
     try:
         from transformers import AutoModel
         logger.info("\nLoading EnCodec model from HuggingFace...")
-        model = AutoModel.from_pretrained("facebook/encodec_24khz", trust_remote_code=True)
+        model_name = "facebook/encodec_48khz" if sample_rate == 48000 else "facebook/encodec_24khz"
+        logger.info(f"Using model: {model_name}")
+        model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
         model.to(device)
         model.eval()
         logger.info("✓ Model loaded successfully")

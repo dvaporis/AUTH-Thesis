@@ -83,7 +83,7 @@ def create_test_video_with_audio(
     
     # Generate audio
     logger.info(f"Generating audio...")
-    sample_rate = 24000
+    sample_rate = 48000
     total_samples = int(duration * sample_rate)
     
     # Create a swept frequency tone
@@ -96,9 +96,12 @@ def create_test_video_with_audio(
     audio += 0.1 * np.sin(2 * phase)
     audio += 0.05 * np.sin(3 * phase)
     
-    # Normalize
+    # Normalize and create stereo channels
     audio = audio / np.max(np.abs(audio)) * 0.8
-    audio = (audio * 32767).astype(np.int16)
+    audio_right = 0.8 * np.sin(phase + 0.08) + 0.1 * np.sin(2 * phase + 0.04) + 0.05 * np.sin(3 * phase + 0.12)
+    audio_right = audio_right / np.max(np.abs(audio_right)) * 0.8
+    audio_stereo = np.stack([audio, audio_right], axis=1)
+    audio_stereo = (audio_stereo * 32767).astype(np.int16)
     
     # Save audio temporarily
     import tempfile
@@ -108,8 +111,8 @@ def create_test_video_with_audio(
         temp_audio_path = temp_audio.name
         
         from scipy.io import wavfile
-        wavfile.write(temp_audio_path, sample_rate, audio)
-        logger.info(f"✓ Audio generated: {len(audio)} samples @ {sample_rate}Hz")
+        wavfile.write(temp_audio_path, sample_rate, audio_stereo)
+        logger.info(f"✓ Audio generated: {len(audio_stereo)} samples @ {sample_rate}Hz (stereo)")
     
     # Combine video and audio using ffmpeg
     logger.info("Combining video and audio with ffmpeg...")
@@ -134,7 +137,7 @@ def create_test_video_with_audio(
             logger.info(f"\n✓ Test video ready: {output_with_audio}")
             logger.info(f"  Duration: {duration}s")
             logger.info(f"  Frames: {total_frames} @ {fps}fps")
-            logger.info(f"  Audio: {len(audio)} samples @ {sample_rate}Hz")
+            logger.info(f"  Audio: {len(audio_stereo)} samples @ {sample_rate}Hz (stereo)")
             return output_with_audio
         else:
             logger.warning("ffmpeg failed, audio not added to video")

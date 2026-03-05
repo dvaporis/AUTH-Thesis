@@ -45,8 +45,8 @@ I've implemented a **complete contrastive learning pipeline for audio** using a 
 
 ### 1. Audio Data Processing
 - ✓ 50% overlapping chunks (equivalent to 16 video frames)
-- ✓ 12,800 samples per chunk (~0.533s at 24kHz)
-- ✓ Automatic resampling to 24kHz
+- ✓ 25,600 samples per chunk (~0.533s at 48kHz)
+- ✓ Automatic resampling to 48kHz
 - ✓ Graceful handling of short/long files
 
 ### 2. Contrastive Learning
@@ -64,13 +64,13 @@ I've implemented a **complete contrastive learning pipeline for audio** using a 
 - ✓ **Manifold mixup** - Embedding space interpolation (α=0.3)
 
 ### 4. Model Architecture
-- ✓ **Frozen EnCodec encoder** from Meta/HuggingFace
+- ✓ **Frozen EnCodec encoder** from Meta/HuggingFace (48kHz stereo)
   - Pre-trained on diverse audio
-  - 128 channels × 40 time steps = 5,120-dim embeddings
+  - Outputs `[batch, 128, 80]` and flattens to 10,240 dimensions
   - No gradient computation
   
 - ✓ **Trainable projection head** (MLP)
-  - 3 hidden layers: 5120 → 512 → 512 → 128
+  - 3 layers: `encoder_dim → 512 → 512 → 128`
   - Batch normalization after each linear layer
   - L2 normalization output for cosine similarity
 
@@ -119,9 +119,9 @@ Results saved to `audio_contrastive_results/`:
 
 ```python
 # Audio
-sample_rate: 24000 Hz           # EnCodec standard
-num_samples: 12800              # Samples per chunk (~0.533s)
-overlap: 50%                    # 6,400 sample stride
+sample_rate: 48000 Hz           # EnCodec stereo model
+num_samples: 25600              # Samples per chunk (~0.533s)
+overlap: 50%                    # 12,800 sample stride
 
 # Training
 batch_size: 32                  # Increase to 64-128 for better contrast
@@ -184,13 +184,13 @@ model.load_state_dict(checkpoint['model_state_dict'])
 model.eval()
 
 # Extract embeddings
-audio = torch.randn(1, 1, 12800)  # [batch, channels, samples]
+audio = torch.randn(1, 2, 25600)  # [batch, channels, samples]
 with torch.no_grad():
     embeddings = model(audio)  # [batch, 128] - normalized
 
 # Compare audio files
-audio1 = torch.randn(1, 1, 12800)
-audio2 = torch.randn(1, 1, 12800)
+audio1 = torch.randn(1, 2, 25600)
+audio2 = torch.randn(1, 2, 25600)
 with torch.no_grad():
     z1 = model(audio1)
     z2 = model(audio2)
@@ -286,18 +286,18 @@ Tests (6 total):
 
 ### EnCodec Encoder
 ```
-Audio [batch, 1, 12800] 
+Audio [batch, 2, 25600] 
   → Convolutional encoder
-  → [batch, 128, 40]
-  (128 channels, 40 time steps)
-  → Flatten to [batch, 5120]
+  → [batch, 128, 80]
+  (128 channels, 80 time steps)
+  → Flatten to [batch, 10240]
 ```
 
 ### Projection Head
 ```
-[batch, 5120]  (frozen encoder output)
+[batch, 10240]  (frozen encoder output)
   ↓
-Linear(5120 → 512) + BatchNorm + ReLU + Dropout(0.1)
+Linear(10240 → 512) + BatchNorm + ReLU + Dropout(0.1)
   ↓
 Linear(512 → 512) + BatchNorm + ReLU + Dropout(0.1)
   ↓

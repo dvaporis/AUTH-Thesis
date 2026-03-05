@@ -11,13 +11,14 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import logging
 from typing import Tuple, Dict
+from scipy.io import wavfile
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-def load_or_create_audio(audio_path: str = None, duration: float = 5.0, sample_rate: int = 24000) -> Tuple[torch.Tensor, int]:
+def load_or_create_audio(audio_path: str = None, duration: float = 5.0, sample_rate: int = 48000) -> Tuple[torch.Tensor, int]:
     """
     Load audio file or create a test signal.
     
@@ -38,27 +39,48 @@ def load_or_create_audio(audio_path: str = None, duration: float = 5.0, sample_r
             waveform = resampler(waveform)
         return waveform, sample_rate
     else:
-        logger.info(f"Creating test signal: {duration}s at {sample_rate}Hz")
+        # Determine number of channels based on sample rate
+        channels = 2 if sample_rate == 48000 else 1
+        logger.info(f"Creating test signal: {duration}s at {sample_rate}Hz, {channels} channel(s)")
+        
         # Create a test signal with multiple frequency components
         num_samples = int(duration * sample_rate)
         t = np.arange(num_samples) / sample_rate
         
-        # Combination of sine waves to create interesting audio
-        signal = (
-            0.3 * np.sin(2 * np.pi * 440 * t) +  # A4 note
-            0.2 * np.sin(2 * np.pi * 880 * t) +  # A5 note
-            0.15 * np.sin(2 * np.pi * 220 * t) +  # A3 note
-            0.1 * np.random.randn(num_samples)  # Add some noise
-        )
-        
-        # Normalize
-        signal = signal / np.max(np.abs(signal)) * 0.95
-        waveform = torch.FloatTensor(signal).unsqueeze(0)
+        if channels == 2:
+            # Create stereo signal with phase-shifted channels
+            left = (
+                0.3 * np.sin(2 * np.pi * 440 * t) +  # A4 note
+                0.2 * np.sin(2 * np.pi * 880 * t) +  # A5 note
+                0.15 * np.sin(2 * np.pi * 220 * t) +  # A3 note
+                0.1 * np.random.randn(num_samples)  # Add some noise
+            )
+            right = (
+                0.3 * np.sin(2 * np.pi * 440.1 * t) +  # Slightly detuned A4
+                0.2 * np.sin(2 * np.pi * 880.05 * t) +  # Slightly detuned A5
+                0.15 * np.sin(2 * np.pi * 220.15 * t) +  # Slightly detuned A3
+                0.1 * np.random.randn(num_samples)  # Different noise
+            )
+            # Normalize each channel
+            left = left / np.max(np.abs(left)) * 0.95
+            right = right / np.max(np.abs(right)) * 0.95
+            waveform = torch.FloatTensor(np.stack([left, right], axis=0))
+        else:
+            # Mono signal
+            signal = (
+                0.3 * np.sin(2 * np.pi * 440 * t) +  # A4 note
+                0.2 * np.sin(2 * np.pi * 880 * t) +  # A5 note
+                0.15 * np.sin(2 * np.pi * 220 * t) +  # A3 note
+                0.1 * np.random.randn(num_samples)  # Add some noise
+            )
+            # Normalize
+            signal = signal / np.max(np.abs(signal)) * 0.95
+            waveform = torch.FloatTensor(signal).unsqueeze(0)
         
         return waveform, sample_rate
 
 
-def load_encodec_model(sample_rate: int = 24000, device=None):
+def load_encodec_model(sample_rate: int = 48000, device=None):
     """
     Load EnCodec model using HuggingFace transformers or Meta's encodec library.
     
@@ -76,10 +98,12 @@ def load_encodec_model(sample_rate: int = 24000, device=None):
     try:
         logger.info("Attempting to load EnCodec via HuggingFace...")
         from transformers import AutoModel
-        model = AutoModel.from_pretrained("facebook/encodec_24khz")
+        model_name = "facebook/encodec_48khz" if sample_rate == 48000 else "facebook/encodec_24khz"
+        logger.info(f"Loading {model_name}...")
+        model = AutoModel.from_pretrained(model_name)
         model.to(device)
         model.eval()
-        logger.info("✓ EnCodec loaded via HuggingFace transformers")
+        logger.info(f"✓ EnCodec loaded via HuggingFace transformers ({sample_rate}Hz)")
         return model
     except Exception as e:
         logger.warning(f"HuggingFace loading failed: {e}")
@@ -175,7 +199,9 @@ def test_encodec_with_compression(audio_path: str = None):
     try:
         from transformers import AutoModel
         logger.info("Loading EnCodec model from HuggingFace...")
-        model = AutoModel.from_pretrained("facebook/encodec_24khz", trust_remote_code=True)
+        model_name = "facebook/encodec_48khz" if sample_rate == 48000 else "facebook/encodec_24khz"
+        logger.info(f"Using model: {model_name}")
+        model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
         model.to(device)
         model.eval()
         
@@ -193,14 +219,27 @@ def test_encodec_with_compression(audio_path: str = None):
             # Encode to codes
             encoded = model.encode(waveform_batch)
             logger.info(f"Encoded output: {type(encoded)}")
-            if isinstance(encoded, tuple):
+            if hasattr(encoded, 'audio_codes'):
+                logger.info(f"  Codes shape: {encoded.audio_codes.shape}")
+            elif isinstance(encoded, tuple):
                 logger.info(f"  Codes shape: {encoded[0].shape}")
             elif hasattr(encoded, 'shape'):
                 logger.info(f"  Codes shape: {encoded.shape}")
             
             # Decode back
             logger.info("Decoding audio...")
-            reconstructed = model.decode(encoded)
+            if hasattr(encoded, 'audio_codes'):
+                decoded_output = model.decode(encoded.audio_codes, encoded.audio_scales)
+            else:
+                decoded_output = model.decode(encoded)
+            
+            # Extract audio from decoder output
+            if hasattr(decoded_output, 'audio_values'):
+                reconstructed = decoded_output.audio_values
+            elif isinstance(decoded_output, tuple):
+                reconstructed = decoded_output[0]
+            else:
+                reconstructed = decoded_output
         
         logger.info(f"Reconstructed shape: {reconstructed.shape}")
         
@@ -242,21 +281,11 @@ def test_encodec_with_compression(audio_path: str = None):
     original_path = output_dir / "original_audio.wav"
     reconstructed_path = output_dir / "reconstructed_audio.wav"
     
-    try:
-        # Try torchaudio first
-        torchaudio.save(original_path, original.cpu(), sample_rate)
-        torchaudio.save(reconstructed_path, reconstructed.cpu(), sample_rate)
-    except (ImportError, ModuleNotFoundError):
-        # Fallback to scipy
-        from scipy.io import wavfile
-        logger.info("Using scipy for audio saving (torchaudio encoding unavailable)")
-        
-        # Convert to PCM format (int16)
-        original_pcm = (original.cpu().numpy() * 32767).astype(np.int16)
-        reconstructed_pcm = (reconstructed.cpu().numpy() * 32767).astype(np.int16)
-        
-        wavfile.write(original_path, sample_rate, original_pcm.T if original_pcm.ndim > 1 else original_pcm)
-        wavfile.write(reconstructed_path, sample_rate, reconstructed_pcm.T if reconstructed_pcm.ndim > 1 else reconstructed_pcm)
+    # Use scipy.io.wavfile to avoid torchcodec dependency
+    original_np = original.cpu().numpy().T  # scipy expects [samples, channels]
+    reconstructed_np = reconstructed.cpu().numpy().T
+    wavfile.write(str(original_path), sample_rate, original_np)
+    wavfile.write(str(reconstructed_path), sample_rate, reconstructed_np)
     logger.info(f"\nSaved original audio to: {original_path}")
     logger.info(f"Saved reconstructed audio to: {reconstructed_path}")
     

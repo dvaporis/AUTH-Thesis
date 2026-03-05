@@ -1,7 +1,7 @@
 # EnCodec Audio Testing - Summary & Results
 
 **Date**: March 2, 2026  
-**Status**: ✅ **SUCCESSFULLY WORKING**
+**Status**: **SUCCESSFULLY WORKING**
 
 ## What Was Set Up
 
@@ -99,7 +99,7 @@ The **quantized codes** from the middle layer are what you'll use as audio embed
 from transformers import AutoModel
 import torch
 
-model = AutoModel.from_pretrained("facebook/encodec_24khz")
+model = AutoModel.from_pretrained("facebook/encodec_48khz")
 encoder = model.encoder  # The part that creates embeddings
 
 # Get audio embeddings
@@ -137,11 +137,11 @@ Use datasets like:
 ## Key Parameters & Customization
 
 ### Model Selection
-Currently using: `facebook/encodec_24khz` from HuggingFace  
+Currently using: `facebook/encodec_48khz` from HuggingFace  
 Other options: Original AudioCraft library (requires more dependencies)
 
 ### Sample Rate
-Fixed at: 24 kHz (EnCodec standard)  
+Fixed at: 48 kHz (stereo EnCodec model)  
 Can test at other rates if needed (2 minute modifications)
 
 ### Audio Duration

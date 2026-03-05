@@ -274,7 +274,7 @@ from transformers import AutoModel
 import torch
 from pathlib import Path
 
-model = AutoModel.from_pretrained("facebook/encodec_24khz")
+model = AutoModel.from_pretrained("facebook/encodec_48khz")
 encoder = model.encoder
 
 # Load all Kaggle audio
@@ -283,9 +283,16 @@ kaggle_files = list(Path("kaggle_datasets").rglob("*.wav"))
 embeddings = []
 for audio_file in kaggle_files[:100]:  # First 100 files
     waveform, sr = torchaudio.load(audio_file)
-    # Resample to 24kHz
+   # Resample to 48kHz and ensure stereo
+   if sr != 48000:
+      waveform = torchaudio.transforms.Resample(sr, 48000)(waveform)
+   if waveform.shape[0] == 1:
+      waveform = waveform.repeat(2, 1)
+   elif waveform.shape[0] > 2:
+      waveform = waveform[:2, :]
+   waveform = waveform.unsqueeze(0)  # [1, 2, samples]
     with torch.no_grad():
-        embedding = encoder(waveform)  # [1, 128, time]
+      embedding = encoder(waveform)  # [1, 128, time]
     embeddings.append(embedding.mean(dim=-1))  # Pool time dimension
 
 # Now you have audio embeddings for contrastive learning!

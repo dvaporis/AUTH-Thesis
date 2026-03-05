@@ -6,7 +6,7 @@ print('Creating model...')
 model = AudioContrastiveModel(config)
 print('[OK] Model created successfully')
 
-dummy_audio = torch.randn(2, 1, 12800)
+dummy_audio = torch.randn(2, 2, 25600)
 print('Testing forward pass...')
 output = model(dummy_audio)
 print(f'[OK] Output shape: {output.shape}')

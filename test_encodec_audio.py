@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import logging
 import sys
+from scipy.io import wavfile
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -75,7 +76,7 @@ def compute_error_metrics(original: torch.Tensor, reconstructed: torch.Tensor) -
     return metrics
 
 
-def load_or_create_audio(audio_path: str = None, duration: float = 5.0, sample_rate: int = 24000) -> tuple:
+def load_or_create_audio(audio_path: str = None, duration: float = 5.0, sample_rate: int = 48000, channels: int = 2) -> tuple:
     """
     Load audio file or create a test signal if no file is provided.
     
@@ -83,6 +84,7 @@ def load_or_create_audio(audio_path: str = None, duration: float = 5.0, sample_r
         audio_path: Path to audio file (optional)
         duration: Duration of test signal in seconds
         sample_rate: Sample rate in Hz
+        channels: Number of channels (2 for stereo, 1 for mono)
     
     Returns:
         Tuple of (waveform, sample_rate)
@@ -90,13 +92,22 @@ def load_or_create_audio(audio_path: str = None, duration: float = 5.0, sample_r
     if audio_path and Path(audio_path).exists():
         logger.info(f"Loading audio from {audio_path}")
         waveform, sr = torchaudio.load(audio_path)
+        
+        # Adjust channels if needed
+        if waveform.shape[0] < channels:
+            # Duplicate channels if too few
+            waveform = waveform.repeat(channels, 1)[:channels]
+        elif waveform.shape[0] > channels:
+            # Average down if too many
+            waveform = waveform[:channels]
+        
         # Resample if necessary
         if sr != sample_rate:
             resampler = torchaudio.transforms.Resample(sr, sample_rate)
             waveform = resampler(waveform)
         return waveform, sample_rate
     else:
-        logger.info(f"Creating test signal: {duration}s at {sample_rate}Hz")
+        logger.info(f"Creating test signal: {duration}s at {sample_rate}Hz, {channels} channel(s)")
         # Create a test signal with multiple frequency components
         num_samples = int(duration * sample_rate)
         t = np.arange(num_samples) / sample_rate
@@ -113,15 +124,29 @@ def load_or_create_audio(audio_path: str = None, duration: float = 5.0, sample_r
         signal = signal / np.max(np.abs(signal)) * 0.95
         waveform = torch.FloatTensor(signal).unsqueeze(0)
         
+        # Create stereo if needed
+        if channels == 2:
+            # Create slightly different signal for right channel
+            signal_r = (
+                0.3 * np.sin(2 * np.pi * 440 * t + 0.1) +  # Slight phase shift
+                0.2 * np.sin(2 * np.pi * 880 * t + 0.05) +
+                0.15 * np.sin(2 * np.pi * 220 * t + 0.15) +
+                0.1 * np.random.randn(num_samples)
+            )
+            signal_r = signal_r / np.max(np.abs(signal_r)) * 0.95
+            waveform_r = torch.FloatTensor(signal_r).unsqueeze(0)
+            waveform = torch.cat([waveform, waveform_r], dim=0)
+        
         return waveform, sample_rate
 
 
-def load_encodec_model(bandwidth: str = "24kbps", device: torch.device = None):
+def load_encodec_model(bandwidth: str = "24kbps", sample_rate: int = 48000, device: torch.device = None):
     """
     Load EnCodec model with fallback strategies.
     
     Args:
         bandwidth: Bandwidth setting ("6kbps", "24kbps", etc.)
+        sample_rate: Sample rate (24000 or 48000)
         device: Device to load model on
         
     Returns:
@@ -130,7 +155,25 @@ def load_encodec_model(bandwidth: str = "24kbps", device: torch.device = None):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Strategy 1: Try using audiocraft
+    # Determine model checkpoint based on sample rate
+    if sample_rate == 48000:
+        model_checkpoint = "facebook/encodec_48khz"
+    else:
+        model_checkpoint = "facebook/encodec_24khz"
+    
+    # Strategy 1: Try using HuggingFace transformers (preferred, used in training)
+    try:
+        from transformers import EncodecModel
+        logger.info(f"Loading EnCodec via transformers from {model_checkpoint}...")
+        model = EncodecModel.from_pretrained(model_checkpoint)
+        model = model.to(device)
+        model.eval()
+        logger.info(f"✓ EnCodec model loaded via transformers ({sample_rate}Hz)")
+        return model, "transformers"
+    except Exception as e:
+        logger.warning(f"transformers loading failed: {e}")
+    
+    # Strategy 2: Try using audiocraft
     try:
         from audiocraft.models import CompressionModel
         logger.info(f"Loading EnCodec via audiocraft...")
@@ -142,20 +185,12 @@ def load_encodec_model(bandwidth: str = "24kbps", device: torch.device = None):
     except Exception as e:
         logger.warning(f"audiocraft loading failed: {e}")
     
-    # Strategy 2: Try using encodec library directly
+    # Strategy 3: Try using encodec library directly
     try:
         from encodec import CompressionModel
         logger.info(f"Loading EnCodec via encodec library...")
-        # encodec expects bandwidth in bits per second
-        bw_mapping = {
-            "1.5kbps": 1500,
-            "3kbps": 3000,
-            "6kbps": 6000,
-            "12kbps": 12000,
-            "24kbps": 24000,
-        }
-        bandwidth_bps = bw_mapping.get(bandwidth, 24000)
-        model = CompressionModel.get_pretrained('encodec_24khz', device=str(device))
+        model_name = 'encodec_48khz' if sample_rate == 48000 else 'encodec_24khz'
+        model = CompressionModel.get_pretrained(model_name, device=str(device))
         model = model.to(device)
         model.eval()
         logger.info("✓ EnCodec model loaded via encodec library")
@@ -163,25 +198,35 @@ def load_encodec_model(bandwidth: str = "24kbps", device: torch.device = None):
     except Exception as e:
         logger.warning(f"encodec library loading failed: {e}")
     
-    # Strategy 3: Create a simple dummy model for testing purposes
+    # Strategy 4: Create a simple dummy model for testing purposes
     logger.warning("Could not load real EnCodec model, will use simple reconstruction")
     return None, "dummy"
 
 
-def test_encodec(audio_path: str = None, bandwidth: str = "24kbps"):
+def test_encodec(audio_path: str = None, bandwidth: str = "24kbps", sample_rate: int = 48000):
     """
     Test EnCodec encoder-decoder.
     
     Args:
         audio_path: Path to audio file (optional, will generate test signal if not provided)
         bandwidth: Bandwidth setting for EnCodec ("1.5kbps", "3kbps", "6kbps", "12kbps", "24kbps")
+        sample_rate: Target sample rate (24000 or 48000)
     """
     logger.info("="*60)
-    logger.info(f"Testing EnCodec with {bandwidth} bandwidth")
+    logger.info(f"Testing EnCodec with {bandwidth} bandwidth at {sample_rate}Hz")
     logger.info("="*60)
     
+    # Determine number of channels based on sample rate
+    channels = 2 if sample_rate == 48000 else 1
+    
     # Load audio
-    waveform, sample_rate = load_or_create_audio(audio_path)
+    waveform, original_sr = load_or_create_audio(audio_path, channels=channels)
+    
+    # Resample if needed to match target sample rate
+    if original_sr != sample_rate:
+        logger.info(f"Resampling from {original_sr}Hz to {sample_rate}Hz")
+        waveform = torchaudio.functional.resample(waveform, original_sr, sample_rate)
+    
     logger.info(f"Audio shape: {waveform.shape}, Sample rate: {sample_rate}Hz")
     
     # Move to GPU if available
@@ -196,7 +241,7 @@ def test_encodec(audio_path: str = None, bandwidth: str = "24kbps"):
     logger.info(f"Waveform shape for model: {waveform.shape}")
     
     # Load model
-    model, model_type = load_encodec_model(bandwidth, device)
+    model, model_type = load_encodec_model(bandwidth, sample_rate, device)
     
     if model is None:
         logger.error("Failed to load EnCodec model using all strategies")
@@ -206,7 +251,18 @@ def test_encodec(audio_path: str = None, bandwidth: str = "24kbps"):
     # Encode and Decode
     logger.info("Encoding audio...")
     with torch.no_grad():
-        if model_type == "audiocraft":
+        if model_type == "transformers":
+            # HuggingFace transformers API
+            encoded = model.encode(waveform)
+            encoded_frames = encoded.audio_codes  # Quantized codes
+            logger.info(f"Encoded shape: {encoded_frames.shape}")
+            
+            # Decode
+            logger.info("Decoding audio...")
+            decoded = model.decode(encoded_frames, encoded.audio_scales)
+            reconstructed = decoded.audio_values  # Extract audio tensor from output
+            
+        elif model_type == "audiocraft":
             encoded_frames = model.encode(waveform)
             logger.info(f"Encoded frames: {len(encoded_frames)}")
             if encoded_frames:
@@ -214,6 +270,7 @@ def test_encodec(audio_path: str = None, bandwidth: str = "24kbps"):
             
             logger.info("Decoding audio...")
             reconstructed = model.decode(encoded_frames)
+            
         elif model_type == "encodec":
             # encodec library usage
             encoded_frames = model.encode(waveform)
@@ -247,8 +304,11 @@ def test_encodec(audio_path: str = None, bandwidth: str = "24kbps"):
     original_path = output_dir / "original_audio.wav"
     reconstructed_path = output_dir / "reconstructed_audio.wav"
     
-    torchaudio.save(original_path, original.cpu(), sample_rate)
-    torchaudio.save(reconstructed_path, reconstructed.cpu(), sample_rate)
+    # Use scipy.io.wavfile to avoid torchcodec dependency
+    original_np = original.cpu().numpy().T  # scipy expects [samples, channels]
+    reconstructed_np = reconstructed.cpu().numpy().T
+    wavfile.write(str(original_path), sample_rate, original_np)
+    wavfile.write(str(reconstructed_path), sample_rate, reconstructed_np)
     logger.info(f"\nSaved original audio to: {original_path}")
     logger.info(f"Saved reconstructed audio to: {reconstructed_path}")
     
@@ -277,6 +337,11 @@ def visualize_comparison(original: np.ndarray, reconstructed: np.ndarray,
         original = original[0]
     if reconstructed.shape[0] > 1:
         reconstructed = reconstructed[0]
+    
+    # Trim reconstructed to match original length (EnCodec may pad)
+    min_length = min(original.shape[-1], reconstructed.shape[-1])
+    original = original[:min_length]
+    reconstructed = reconstructed[:min_length]
     
     fig, axes = plt.subplots(3, 1, figsize=(14, 10))
     
@@ -356,13 +421,16 @@ if __name__ == "__main__":
     parser.add_argument("--bandwidth", type=str, default="6kbps", 
                        choices=["1.5kbps", "3kbps", "6kbps", "12kbps", "24kbps"],
                        help="EnCodec bandwidth")
+    parser.add_argument("--sample-rate", type=int, default=48000,
+                       choices=[24000, 48000],
+                       help="Sample rate (default: 48000 stereo; 24000 for mono)")
     parser.add_argument("--duration", type=float, default=5.0,
                        help="Duration of test signal in seconds (if no audio file provided)")
     
     args = parser.parse_args()
     
     try:
-        metrics, shape = test_encodec(audio_path=args.audio, bandwidth=args.bandwidth)
+        metrics, shape = test_encodec(audio_path=args.audio, bandwidth=args.bandwidth, sample_rate=args.sample_rate)
         logger.info("\n" + "="*60)
         logger.info("EnCodec test completed successfully!")
         logger.info("="*60)

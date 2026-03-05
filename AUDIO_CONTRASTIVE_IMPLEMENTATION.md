@@ -20,9 +20,9 @@ Complete implementation of audio contrastive learning using frozen EnCodec encod
 
 ### AudioConfig
 Configuration for audio processing:
-- Sample rate: 24kHz (EnCodec standard)
-- Chunk size: 12,800 samples (~0.533s)
-- Overlap: 50% (6,400 sample stride)
+- Sample rate: 48kHz (EnCodec stereo)
+- Chunk size: 25,600 samples (~0.533s)
+- Overlap: 50% (12,800 sample stride)
 - Augmentation parameters (noise, stretch, phase shift)
 
 ### AudioAugmentation
@@ -77,16 +77,16 @@ Contrastive loss with semantic + temporal components:
 Raw .wav files (Kaggle dataset)
     ↓
 AudioChunkDataset (overlapping chunks)
-    ├─ Load and resample to 24kHz
-    ├─ Extract 12,800 sample chunks
+    ├─ Load and resample to 48kHz
+    ├─ Extract 25,600 sample chunks
     ├─ Apply augmentation (1-3 random techniques)
     ├─ Return: (audio, file_idx, temporal_pos)
     ↓
 DataLoader (batching)
     ↓
 AudioContrastiveModel
-    ├─ EnCodec.encoder() → [batch, 128, 40]
-    ├─ Flatten → [batch, 5120]
+    ├─ EnCodec.encoder() → [batch, channels, time]
+    ├─ Flatten → [batch, encoder_dim]
     ├─ ProjectionHead → [batch, 128] (normalized)
     ↓
 ContrastiveLoss
@@ -185,10 +185,10 @@ val_ratio: 0.20
 test_ratio: 0.20
 
 # Audio
-sample_rate: 24000 Hz
-num_samples: 12800 (per chunk)
+sample_rate: 48000 Hz
+num_samples: 25600 (per chunk)
 overlap: 50%
-stride: 6400 samples
+stride: 12800 samples
 
 # Augmentation
 noise_snr: 20 dB
@@ -265,14 +265,15 @@ Future improvements:
 
 ## Known Limitations
 
-1. **Fixed input size** - All chunks must be exactly 12,800 samples
+1. **Fixed input size** - All chunks must be exactly 25,600 samples
    - Short files are padded
    - Long files are chunked with overlap
 
-2. **Mono audio only** - Stereo converted to mono
-   - Future: Support stereo with separate channels
+2. **Channel handling** - Pipeline uses stereo input (2 channels)
+   - Files with fewer channels are zero-padded
+   - Files with extra channels are truncated to the first 2
 
-3. **Fixed sample rate** - All audio resampled to 24kHz
+3. **Fixed sample rate** - All audio resampled to 48kHz
    - EnCodec requirement
    - Quality loss if original is lower rate
 

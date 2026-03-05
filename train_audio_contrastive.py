@@ -43,10 +43,11 @@ logger = logging.getLogger(__name__)
 @dataclass
 class AudioConfig:
     """Configuration for audio processing."""
-    sample_rate: int = 24000  # EnCodec default
-    num_samples: int = 12800  # ~16 video frames at 30fps
+    sample_rate: int = 48000  # EnCodec 48kHz stereo
+    num_samples: int = 25600  # ~16 video frames at 30fps
     overlap: float = 0.5  # 50% overlap
-    stride: int = 6400  # samples (50% of num_samples)
+    stride: int = 12800  # samples (50% of num_samples)
+    num_channels: int = 2  # stereo
     
     # EnCodec config
     encodec_bandwidth: float = 6.0  # kbps
@@ -309,11 +310,8 @@ class AudioChunkDataset(torch.utils.data.Dataset):
                 # Load audio to get length
                 sr, audio_data = wavfile.read(str(audio_file))
                 
-                # Convert to mono if stereo
-                if audio_data.ndim > 1:
-                    audio_data = audio_data.mean(axis=1)
-                
-                audio_length = len(audio_data)
+                # Keep original channel layout; length is along sample axis
+                audio_length = audio_data.shape[0] if audio_data.ndim > 1 else len(audio_data)
                 
                 # Calculate number of chunks with overlap
                 num_chunks = (audio_length - self.config.num_samples) // self.config.stride + 1
@@ -364,26 +362,37 @@ class AudioChunkDataset(torch.utils.data.Dataset):
             else:
                 start_sample = chunk_info['start_sample']
             
-            # Convert to mono if stereo
-            if audio_data.ndim > 1:
-                audio_data = audio_data.mean(axis=1)
+            # Ensure shape is [samples, channels] for consistent slicing
+            if audio_data.ndim == 1:
+                audio_data = audio_data[:, np.newaxis]
             
-            # Extract chunk
+            # Keep exactly configured number of channels
+            if audio_data.shape[1] < self.config.num_channels:
+                pad_channels = self.config.num_channels - audio_data.shape[1]
+                audio_data = np.pad(audio_data, ((0, 0), (0, pad_channels)), mode='constant')
+            elif audio_data.shape[1] > self.config.num_channels:
+                audio_data = audio_data[:, :self.config.num_channels]
+            
+            # Extract chunk [samples, channels]
             audio_chunk = audio_data[start_sample:start_sample + self.config.num_samples]
             
             # Ensure chunk has correct length (pad if needed)
-            if len(audio_chunk) < self.config.num_samples:
-                # Pad with zeros if chunk is too short
-                audio_chunk = np.pad(audio_chunk, (0, self.config.num_samples - len(audio_chunk)), mode='constant')
+            if audio_chunk.shape[0] < self.config.num_samples:
+                pad_samples = self.config.num_samples - audio_chunk.shape[0]
+                audio_chunk = np.pad(audio_chunk, ((0, pad_samples), (0, 0)), mode='constant')
             
             # Normalize to float32 [-1, 1]
             if audio_chunk.dtype == np.int16:
                 audio_chunk = audio_chunk.astype(np.float32) / 32768.0
             elif audio_chunk.dtype == np.int32:
                 audio_chunk = audio_chunk.astype(np.float32) / 2147483648.0
+            elif audio_chunk.dtype == np.uint8:
+                audio_chunk = (audio_chunk.astype(np.float32) - 128.0) / 128.0
+            else:
+                audio_chunk = audio_chunk.astype(np.float32)
             
-            # Convert to tensor [1, samples]
-            audio_tensor = torch.from_numpy(audio_chunk).unsqueeze(0).float()
+            # Convert to tensor [channels, samples]
+            audio_tensor = torch.from_numpy(audio_chunk).transpose(0, 1).float()
             
             # Apply augmentation with 60% probability (not every sample)
             if self.augment and self.augmentation is not None and random.random() < 0.6:
@@ -403,7 +412,7 @@ class AudioChunkDataset(torch.utils.data.Dataset):
             logger.error(f"Error loading chunk {idx}: {e}")
             # Return a zero tensor as fallback
             return {
-                'audio': torch.zeros(1, self.config.num_samples),
+                'audio': torch.zeros(self.config.num_channels, self.config.num_samples),
                 'file_idx': -1,
                 'temporal_pos': -1,
                 'chunk_idx': idx,
@@ -443,15 +452,15 @@ class AudioContrastiveModel(nn.Module):
         # Load frozen EnCodec encoder from HuggingFace
         try:
             from transformers import EncodecModel
-            self.encodec = EncodecModel.from_pretrained("facebook/encodec_24khz")
+            self.encodec = EncodecModel.from_pretrained("facebook/encodec_48khz")
             self.use_hf_encodec = True
-            logger.info("Loaded EnCodec from HuggingFace transformers")
+            logger.info("Loaded EnCodec from HuggingFace transformers (48kHz stereo)")
         except ImportError:
             # Fallback to audiocraft if transformers not available
             from audiocraft.models import CompressionModel
-            self.encodec = CompressionModel.get_pretrained('facebook/encodec_24khz')
+            self.encodec = CompressionModel.get_pretrained('facebook/encodec_48khz')
             self.use_hf_encodec = False
-            logger.info("Loaded EnCodec from audiocraft")
+            logger.info("Loaded EnCodec from audiocraft (48kHz stereo)")
         
         # Freeze EnCodec parameters
         for param in self.encodec.parameters():
@@ -464,7 +473,7 @@ class AudioContrastiveModel(nn.Module):
         
         # Determine encoder output dimension by running a dummy forward pass
         with torch.no_grad():
-            dummy_audio = torch.randn(1, 1, 12800)
+            dummy_audio = torch.randn(1, 2, 25600)
             if self.use_hf_encodec:
                 # HuggingFace version - use encoder directly for continuous embeddings
                 # Returns [batch, channels, time]
@@ -679,7 +688,7 @@ def train_epoch(model: AudioContrastiveModel, dataloader: torch.utils.data.DataL
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{total_epochs}", unit="batch", leave=True)
     
     for batch in pbar:
-        audio = batch['audio'].to(device)  # [batch, 1, samples]
+        audio = batch['audio'].to(device)  # [batch, channels, samples]
         file_idx = batch['file_idx'].to(device)
         temporal_pos = batch['temporal_pos'].to(device)
         

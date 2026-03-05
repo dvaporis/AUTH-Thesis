@@ -21,9 +21,9 @@ I've implemented a complete audio contrastive learning pipeline with the followi
    - ✓ Manifold mixup (embedding space feature mixing)
 
 3. **EnCodec Integration**
-   - Frozen pre-trained EnCodec model (facebook/encodec_24khz)
+   - Frozen pre-trained EnCodec model (facebook/encodec_48khz, stereo)
    - Automatically loads from HuggingFace with fallback to audiocraft
-   - Continuous embeddings: 5,120-dimensional (128 channels × 40 time steps)
+   - Continuous embeddings: 10,240-dimensional (128 channels × 80 time steps)
    - Projection head: 3-layer MLP with batch norm and dropout
 
 4. **Contrastive Learning**
@@ -94,10 +94,10 @@ Training creates an `audio_contrastive_results/` directory with:
 
 ### AudioConfig
 ```python
-sample_rate: 24000          # EnCodec sampling rate
-num_samples: 12800          # Samples per chunk (~0.533s)
-overlap: 0.5                # 50% overlap
-stride: 6400                # Sample stride between chunks
+sample_rate: 48000          # EnCodec 48kHz stereo
+num_samples: 25600          # Samples per chunk (~0.533s)
+overlapfloat = 0.5                # 50% overlap
+stride: 12800               # Sample stride between chunks
 
 # Augmentation
 noise_level_db: 20.0        # SNR for additive noise (signal 100x stronger)
@@ -132,16 +132,16 @@ hidden_dim: 512             # MLP hidden dimension
 ## Architecture Details
 
 ### EnCodec Encoder
-- **Input:** [batch, 1, 12800] (mono audio)
-- **Output:** [batch, 128, 40] (continuous embeddings)
+- **Input:** [batch, 2, 25600] (stereo audio, 48kHz)
+- **Output:** [batch, 128, 80] (continuous embeddings)
 - Frozen parameters (no gradients)
 - Pre-trained on diverse audio data
 
 ### Projection Head
 ```
-Input: [batch, 5120] (flattened encoder output)
+Input: [batch, encoder_dim] (flattened encoder output, inferred at runtime)
 ↓
-Linear(5120 → 512) + BatchNorm + ReLU + Dropout(0.1)
+Linear(encoder_dim → 512) + BatchNorm + ReLU + Dropout(0.1)
 ↓
 Linear(512 → 512) + BatchNorm + ReLU + Dropout(0.1)
 ↓
@@ -220,7 +220,7 @@ audio_contrastive_results/           # Training outputs
    model.load_state_dict(checkpoint['model_state_dict'])
    
    # Use model for embeddings
-   audio = torch.randn(1, 1, 12800)  # [batch, channels, samples]
+   audio = torch.randn(1, 2, 25600)  # [batch, channels, samples]
    embeddings = model(audio)  # [batch, 128] normalized embeddings
    ```
 
