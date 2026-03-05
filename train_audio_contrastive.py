@@ -539,9 +539,12 @@ class AudioContrastiveModel(nn.Module):
         with torch.no_grad():
             # Use encoder directly to get continuous embeddings [batch, channels, time]
             encoded = self.encodec.encoder(audio)
+            logger.debug(f"EnCodec encoder raw output shape: {encoded.shape}")
+            
             # Flatten temporal and channel dimensions
             batch_size = encoded.shape[0]
             embeddings = encoded.reshape(batch_size, -1)
+            logger.debug(f"Flattened embeddings shape: {embeddings.shape} (dim={embeddings.shape[1]})")
         
         return embeddings
     
@@ -557,6 +560,7 @@ class AudioContrastiveModel(nn.Module):
         """
         embeddings = self.encode(audio)
         projections = self.projection_head(embeddings)
+        logger.debug(f"Projection head output shape: {projections.shape} (dim={projections.shape[1]})")
         return projections
 
 
