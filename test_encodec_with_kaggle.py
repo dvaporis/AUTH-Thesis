@@ -1,19 +1,21 @@
 """
 Enhanced EnCodec test using Kaggle audio-visual dataset.
 
-This script extends the basic test to work with real audio files from the 
+This script extends the basic test to work with real audio/video files from the 
 Audio-Visual Database of Emotional Speech and Song dataset.
+Supports extracting audio from MP4 videos or loading from WAV files.
 Extracts fixed sample counts (no padding) and displays actual duration based on sample rate.
 
 Usage:
     # First download the dataset
     python download_kaggle_dataset.py
     
-    # Then test with dataset audio files
+    # Then test with dataset files (prefers MP4 videos)
     python test_encodec_with_kaggle.py --use-kaggle
     
     # Or test specific file
     python test_encodec_with_kaggle.py --audio path/to/audio.wav
+    python test_encodec_with_kaggle.py --audio path/to/video.mp4
 """
 
 import torch
@@ -24,6 +26,7 @@ from pathlib import Path
 import logging
 from typing import Tuple, Dict, Optional
 import random
+import av
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -32,13 +35,14 @@ logger = logging.getLogger(__name__)
 
 def find_kaggle_audio_files(kaggle_dir: str = "kaggle_datasets") -> list:
     """
-    Find all audio files in the Kaggle dataset directory.
+    Find all audio/video files in the Kaggle dataset directory.
+    Prioritizes MP4 video files with embedded audio.
     
     Args:
         kaggle_dir: Root directory of Kaggle dataset
         
     Returns:
-        List of audio file paths
+        List of audio/video file paths
     """
     import os
     
@@ -49,11 +53,22 @@ def find_kaggle_audio_files(kaggle_dir: str = "kaggle_datasets") -> list:
         Path(os.environ.get("USERPROFILE", "~")) / ".cache/kagglehub/datasets",
     ]
     
-    audio_extensions = {'.wav', '.mp3', '.flac', '.ogg', '.m4a'}
     audio_files = []
     
     for kaggle_path in possible_paths:
         if kaggle_path.exists():
+            # First try to find video files (preferred - embedded audio)
+            video_extensions = {'.mp4', '.avi', '.mov', '.mkv'}
+            for ext in video_extensions:
+                video_files = list(kaggle_path.rglob(f"*{ext}"))
+                audio_files.extend(video_files)
+            
+            if audio_files:
+                logger.info(f"Found {len(audio_files)} video files (will extract audio) in {kaggle_path}")
+                break
+            
+            # Fallback to audio files
+            audio_extensions = {'.wav', '.mp3', '.flac', '.ogg', '.m4a'}
             for file in kaggle_path.rglob("*"):
                 if file.suffix.lower() in audio_extensions:
                     audio_files.append(file)
@@ -68,11 +83,12 @@ def find_kaggle_audio_files(kaggle_dir: str = "kaggle_datasets") -> list:
 def load_or_create_audio(audio_path: Optional[str] = None, duration: float = 5.0, 
                          sample_rate: int = 48000, num_samples: int = 25600) -> Tuple[torch.Tensor, int, float, str]:
     """
-    Load audio file or create a test signal.
+    Load audio from audio/video file or create a test signal.
+    Supports extracting audio from MP4 videos using PyAV.
     Extracts exactly num_samples without padding (matching video encoder approach).
     
     Args:
-        audio_path: Path to audio file (optional)
+        audio_path: Path to audio/video file (optional)
         duration: Duration of test signal in seconds
         sample_rate: Sample rate in Hz
         num_samples: Number of samples to extract (default 25600 ≈ 16 frames at 30fps at 48kHz)
@@ -83,22 +99,73 @@ def load_or_create_audio(audio_path: Optional[str] = None, duration: float = 5.0
     """
     if audio_path and Path(audio_path).exists():
         logger.info(f"Loading audio from: {audio_path}")
+        file_path = Path(audio_path)
+        is_video = file_path.suffix.lower() in {'.mp4', '.avi', '.mov', '.mkv'}
+        
         try:
-            # Try scipy first (more reliable for WAV files)
-            from scipy.io import wavfile
-            sr, audio_data = wavfile.read(audio_path)
-            
-            # Convert to float and normalize
-            if audio_data.dtype == np.int16:
-                audio_data = audio_data.astype(np.float32) / 32768.0
-            elif audio_data.dtype == np.int32:
-                audio_data = audio_data.astype(np.float32) / 2147483648.0
-            
-            # Convert to torch tensor
-            if audio_data.ndim == 1:
-                waveform = torch.from_numpy(audio_data).unsqueeze(0)
+            if is_video:
+                # Extract audio from video using PyAV
+                logger.info(f"Extracting audio from video file...")
+                container = av.open(str(audio_path))
+                
+                audio_stream = container.streams.audio[0] if container.streams.audio else None
+                if not audio_stream:
+                    container.close()
+                    raise ValueError("No audio stream in video file")
+                
+                sr = audio_stream.rate
+                
+                # Decode all audio frames
+                audio_frames = []
+                for frame in container.decode(audio=0):
+                    audio_data = frame.to_ndarray()
+                    
+                    # Ensure [samples, channels] format
+                    if audio_data.ndim == 1:
+                        audio_data = audio_data.reshape(-1, 1)
+                    elif audio_data.shape[0] < audio_data.shape[1]:
+                        audio_data = audio_data.T
+                    
+                    audio_frames.append(audio_data)
+                
+                container.close()
+                
+                if not audio_frames:
+                    raise ValueError("No audio frames decoded")
+                
+                # Concatenate and convert
+                audio_data = np.concatenate(audio_frames, axis=0)
+                
+                # Normalize
+                if audio_data.dtype == np.int16:
+                    audio_data = audio_data.astype(np.float32) / 32768.0
+                elif audio_data.dtype == np.int32:
+                    audio_data = audio_data.astype(np.float32) / 2147483648.0
+                else:
+                    audio_data = audio_data.astype(np.float32)
+                
+                # Convert to torch [channels, samples]
+                if audio_data.ndim == 1:
+                    waveform = torch.from_numpy(audio_data).unsqueeze(0)
+                else:
+                    waveform = torch.from_numpy(audio_data.T)
+                
             else:
-                waveform = torch.from_numpy(audio_data.T)
+                # Load WAV file with scipy
+                from scipy.io import wavfile
+                sr, audio_data = wavfile.read(audio_path)
+                
+                # Convert to float and normalize
+                if audio_data.dtype == np.int16:
+                    audio_data = audio_data.astype(np.float32) / 32768.0
+                elif audio_data.dtype == np.int32:
+                    audio_data = audio_data.astype(np.float32) / 2147483648.0
+                
+                # Convert to torch tensor
+                if audio_data.ndim == 1:
+                    waveform = torch.from_numpy(audio_data).unsqueeze(0)
+                else:
+                    waveform = torch.from_numpy(audio_data.T)
             
             # Resample if necessary
             if sr != sample_rate:

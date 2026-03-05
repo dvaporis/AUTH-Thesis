@@ -27,6 +27,8 @@ python test_encodec_with_kaggle.py --use-kaggle
 
 # Test specific audio file
 python test_encodec_with_kaggle.py --audio C:\path\to\audio.wav
+# Or extract from video
+python test_encodec_with_kaggle.py --audio C:\path\to\video.mp4
 ```
 
 ### 4. View Results

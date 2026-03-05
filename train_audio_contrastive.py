@@ -31,6 +31,7 @@ from scipy import signal as scipy_signal
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import warnings
+import av
 
 # Suppress scipy WAV file warnings
 warnings.filterwarnings('ignore', category=wavfile.WavFileWarning)
@@ -307,11 +308,19 @@ class AudioChunkDataset(torch.utils.data.Dataset):
         
         for file_idx, audio_file in enumerate(self.audio_files):
             try:
-                # Load audio to get length
-                sr, audio_data = wavfile.read(str(audio_file))
+                # Check if it's a video file
+                is_video = audio_file.suffix.lower() in ['.mp4', '.avi', '.mov', '.mkv']
                 
-                # Keep original channel layout; length is along sample axis
-                audio_length = audio_data.shape[0] if audio_data.ndim > 1 else len(audio_data)
+                if is_video:
+                    # Extract audio from video
+                    audio_data, sr = extract_audio_from_video(audio_file, self.config.sample_rate)
+                    if audio_data is None:
+                        continue
+                    audio_length = audio_data.shape[0]
+                else:
+                    # Load WAV file to get length
+                    sr, audio_data = wavfile.read(str(audio_file))
+                    audio_length = audio_data.shape[0] if audio_data.ndim > 1 else len(audio_data)
                 
                 # Calculate number of chunks with overlap
                 num_chunks = (audio_length - self.config.num_samples) // self.config.stride + 1
@@ -327,6 +336,7 @@ class AudioChunkDataset(torch.utils.data.Dataset):
                         'file_path': audio_file,
                         'start_sample': start_sample,
                         'sample_rate': sr,
+                        'is_video': is_video,
                     })
                     
             except Exception as e:
@@ -348,23 +358,37 @@ class AudioChunkDataset(torch.utils.data.Dataset):
         chunk_info = self.chunks[idx]
         
         try:
-            # Load audio chunk
-            sr, audio_data = wavfile.read(str(chunk_info['file_path']))
-            
-            # Resample if needed
-            if sr != self.config.sample_rate:
-                audio_data = scipy_signal.resample(
-                    audio_data, 
-                    int(len(audio_data) * self.config.sample_rate / sr)
-                )
-                # Recalculate start sample for new sample rate
-                start_sample = int(chunk_info['start_sample'] * self.config.sample_rate / sr)
-            else:
+            if chunk_info['is_video']:
+                # Extract full audio from video
+                audio_data, sr = extract_audio_from_video(chunk_info['file_path'], self.config.sample_rate)
+                if audio_data is None:
+                    raise ValueError("Failed to extract audio from video")
                 start_sample = chunk_info['start_sample']
+            else:
+                # Load WAV file
+                sr, audio_data = wavfile.read(str(chunk_info['file_path']))
+                
+                # Resample if needed
+                if sr != self.config.sample_rate:
+                    audio_data = scipy_signal.resample(
+                        audio_data, 
+                        int(len(audio_data) * self.config.sample_rate / sr)
+                    )
+                    # Recalculate start sample for new sample rate
+                    start_sample = int(chunk_info['start_sample'] * self.config.sample_rate / sr)
+                else:
+                    start_sample = chunk_info['start_sample']
+                
+                # Ensure shape is [samples, channels] for consistent slicing
+                if audio_data.ndim == 1:
+                    audio_data = audio_data[:, np.newaxis]
             
-            # Ensure shape is [samples, channels] for consistent slicing
+            # Ensure audio_data is [samples, channels]
             if audio_data.ndim == 1:
                 audio_data = audio_data[:, np.newaxis]
+            elif audio_data.shape[0] < audio_data.shape[1]:
+                # If it's [channels, samples], transpose it
+                audio_data = audio_data.T
             
             # Keep exactly configured number of channels
             if audio_data.shape[1] < self.config.num_channels:
@@ -620,8 +644,77 @@ class ContrastiveLoss(nn.Module):
         }
 
 
+def extract_audio_from_video(video_path: Path, target_sr: int = 48000) -> Tuple[np.ndarray, int]:
+    """
+    Extract complete audio from a video file using PyAV.
+    
+    Args:
+        video_path: Path to video file (.mp4, .avi, etc.)
+        target_sr: Target sample rate
+        
+    Returns:
+        Tuple of (audio_data, sample_rate)
+        - audio_data: [samples, channels] numpy array
+        - sample_rate: Sample rate in Hz
+    """
+    try:
+        container = av.open(str(video_path))
+        
+        # Get audio stream
+        audio_stream = container.streams.audio[0] if container.streams.audio else None
+        if not audio_stream:
+            container.close()
+            logger.warning(f"No audio stream in {video_path.name}")
+            return None, None
+        
+        audio_sr = audio_stream.rate
+        
+        # Decode all audio frames
+        audio_frames = []
+        for frame in container.decode(audio=0):
+            audio_data = frame.to_ndarray()
+            
+            # Ensure [samples, channels] format
+            if audio_data.ndim == 1:
+                audio_data = audio_data.reshape(-1, 1)
+            elif audio_data.shape[0] < audio_data.shape[1]:
+                audio_data = audio_data.T
+            
+            audio_frames.append(audio_data)
+        
+        container.close()
+        
+        if not audio_frames:
+            logger.warning(f"No audio frames decoded from {video_path.name}")
+            return None, None
+        
+        # Concatenate all frames
+        audio_full = np.concatenate(audio_frames, axis=0)
+        
+        # Normalize to float32
+        if audio_full.dtype == np.int16:
+            audio_full = audio_full.astype(np.float32) / 32768.0
+        elif audio_full.dtype == np.int32:
+            audio_full = audio_full.astype(np.float32) / 2147483648.0
+        else:
+            audio_full = audio_full.astype(np.float32)
+        
+        # Resample if needed
+        if audio_sr != target_sr:
+            num_samples_new = int(audio_full.shape[0] * target_sr / audio_sr)
+            audio_resampled = scipy_signal.resample(audio_full, num_samples_new, axis=0)
+            audio_full = audio_resampled.astype(np.float32)
+            audio_sr = target_sr
+        
+        return audio_full, audio_sr
+        
+    except Exception as e:
+        logger.warning(f"Failed to extract audio from {video_path.name}: {e}")
+        return None, None
+
+
 def find_kaggle_audio_files() -> List[Path]:
-    """Find all .wav files in Kaggle dataset."""
+    """Find all audio/video files in Kaggle dataset (prioritizes MP4 videos with embedded audio)."""
     import os
     
     possible_paths = [
@@ -634,6 +727,18 @@ def find_kaggle_audio_files() -> List[Path]:
     
     for kaggle_path in possible_paths:
         if kaggle_path.exists():
+            # First try to find video files (preferred - embedded audio)
+            video_extensions = ['.mp4', '.avi', '.mov', '.mkv']
+            video_files = []
+            for ext in video_extensions:
+                video_files.extend(kaggle_path.rglob(f"*{ext}"))
+            
+            if video_files:
+                logger.info(f"Found {len(video_files)} video files (will extract audio) in {kaggle_path}")
+                audio_files = video_files
+                break
+            
+            # Fallback to WAV files if no videos found
             audio_files = list(kaggle_path.rglob("*.wav"))
             if audio_files:
                 logger.info(f"Found {len(audio_files)} .wav files in {kaggle_path}")

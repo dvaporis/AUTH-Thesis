@@ -4,3 +4,4 @@ audiocraft>=1.0.0
 numpy>=1.21.0
 matplotlib>=3.5.0
 scipy>=1.7.0
+av>=10.0.0

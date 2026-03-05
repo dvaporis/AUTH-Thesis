@@ -80,7 +80,7 @@ First, download the Kaggle audio-visual dataset:
 python download_kaggle_dataset.py
 ```
 
-This will download the Audio-Visual Database of Emotional Speech and Song dataset containing .wav files.
+This will download the Audio-Visual Database of Emotional Speech and Song dataset containing .mp4 video files with embedded audio.
 
 ## Usage
 
@@ -264,7 +264,7 @@ Where:
 ### No Audio Files Found
 
 ```
-ERROR: No audio files found! Please run download_kaggle_dataset.py first.
+ERROR: No audio/video files found! Please run download_kaggle_dataset.py first.
 ```
 
 **Solution**: Run the dataset download script:

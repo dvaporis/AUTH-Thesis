@@ -37,7 +37,7 @@ Data augmentation techniques:
 
 ### AudioChunkDataset
 PyTorch Dataset for overlapping audio chunks:
-- Loads .wav files from Kaggle dataset
+- Loads audio from MP4 video files or .wav files from Kaggle dataset
 - Extracts overlapping chunks with configurable stride
 - Handles edge cases (short files, normalization)
 - Returns: audio tensor, file index, temporal position
@@ -74,7 +74,7 @@ Contrastive loss with semantic + temporal components:
 ## Data Pipeline
 
 ```
-Raw .wav files (Kaggle dataset)
+Raw audio from video/audio files (Kaggle dataset)
     ↓
 AudioChunkDataset (overlapping chunks)
     ├─ Load and resample to 48kHz
@@ -213,7 +213,7 @@ mixup_probability: 0.3
 - No memory scaling issue due to frozen encoder
 
 **Training Speed:**
-- 1 epoch (2452 .wav files): ~30-60 seconds on single GPU
+- 1 epoch (2452 video/audio files): ~30-60 seconds on single GPU
 - 50 epochs: ~25-50 minutes
 
 **Expected Convergence:**

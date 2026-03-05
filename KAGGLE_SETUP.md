@@ -120,6 +120,8 @@ This:
 
 ```bash
 python test_encodec_with_kaggle.py --audio path/to/audio.wav
+# Or use video file
+python test_encodec_with_kaggle.py --audio path/to/video.mp4
 ```
 
 ### Option 3: Generate vs Real Comparison
