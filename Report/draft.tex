@@ -104,9 +104,9 @@ The method proposed is very similar to the one proposed in Diff-Foley \cite{Diff
 \item Possible conversion to Grayscale instead of RGB to further reduce the data incorporated.
 \item Masking: Two forms of masking are possible, temporal and spatial. Temporal masking involves adding noise to (or completely covering) a relatively small number of frames of the video bite in their entirety, whereas spatial masking constitutes of adding noise to specific areas of the video bite (i.e. near the left part of the lip) for the entire video bite (or, again, covering/removing them entirely).
 \end{itemize}
-The final processed data is passed into the Video Encoder (i.e. VideoMAE \cite{VideoMAE}, works with a high masking percentage).
+The final processed data is passed into the Video Encoder (i.e. VideoMAE \cite{VideoMAE}, works with a high masking percentage). Meta's VideoMAE v2 base model from Hugging Face was chosen \cite{VideoMAEv2}.
 
-(6): The audio is also processed and encoded, using the Mel-spectogram. A Pre-trained Audio Variational Autoencoder (VAE) is used, since it is trained to both encode and decode to and from the resulting latent space, while retaining phase information (crucial for correct reconstruction and alignment of lip movements and sounds generated). Examples of architectures to be considered: HTS-AT \cite{HTS-AT} or the VAE used in AudioLDM \cite{AudioLDM}.
+(6): The audio is also processed and encoded, using the Mel-spectogram. A Pre-trained Audio Variational Autoencoder (VAE) is used, since it is trained to both encode and decode to and from the resulting latent space, while retaining phase information (crucial for correct reconstruction and alignment of lip movements and sounds generated). Examples of architectures to be considered: HTS-AT \cite{HTS-AT} or the VAE used in AudioLDM \cite{AudioLDM}. Due to issues with the dependencies of the video encoder alongside the audio encoder, EnCodec from Meta was chosen \cite{EnCodec}.
 
 (7): Lastly, the Contrastive Learning Objective is applied, by the result of which the fine-tuning of the encoders is driven. The Contrastive Learning Objective is very similar to the one presented in Diff-Foley \cite{Diff-Foley}, containing a Semantic Contrast and a Temporal Contrast. The Semantic Contrast aims to maximize the similarity score of video-audio bite pairs coming from the same video while minimizing the score of video-audio bite pairs coming from different ones (if not using many different videos with different speakers, then totally different parts of the video, maybe with a completely different context/emotion/tone of the speaker). The Temporal Contrast aims to maximize the similarity of video-audio bite pairs that come from the same time segment of the video, whereas it minimizes the similarity score of pairs coming from different time segments, making precise timing crucial (this is why an overlap is also proposed, to enhance learning of precise timing).
 
@@ -140,6 +140,19 @@ Following this process, a speech waveform is produced for every video bite of th
 
 This proposed method is largely subject to change, upon discussion with the supervisor.
 
+\section{Testing of singular features of the proposed method}
+
+Before testing the method in its entirety, tests were conducted with each module of the method separately. This led to a more solid understanding of the process as well as every singular module. The process included testing the audio encoding and decoding of the chosen audio VAE (EnCodec \cite{EnCodec}), testing the encoding capabilities of the video encoder chosen (VideoMAE v2 \cite{VideoMAEv2}), testing Contrastive Learning solely on audio segments from speech (not in contrast to the videos they originated from) using viable data augmentation techniques which will be discussed below, as well as similarly testing Contrastive Learning solely on the video segments while augmenting the data properly.
+
+Some key observations crucial to the understanding of the results below are showcased in this section:
+
+\begin{itemize}
+\item The dataset chosen for this purpose is RAVDESS \cite{RAVDESS}, which contains both videos and pure audio of actors speaking or singing specific phrases. The videos are .mp4 files with resolution 1280×720, a framerate of 29.97 fps and stereo sound (which is ignored since pure audio files are also contained in the dataset). The audio files are .wav.
+\item The video encoder VideoMAE v2 \cite{VideoMAEv2} produces a 768-dimensional vector embedding per 16-frame video segment. At 29.97 fps, this results in video bites with length around 0.534 seconds. Importantly, the video encoder does not provide a meaningful decoding from the embedding space, meaning the opposite reconstruction (video of speech from audio) is impossible with the current setup. 
+\item The audio VAE \cite{EnCodec} receives stereo 48kHz audio (the audio files are actually mono because they are created from the mp4 files of the videos for perfect alignment, but the samples are cloned to use the stereo model), which for a duration of about 0.534s amounts to 25626 samples, returning a matrix that leads to a flattened vector of dimension 10240 (quite high). This number is the result of this operation: 25626 (total samples in audio bite) / 640 samples/frame $\approx$ 40 frames, with each frame encoded in 256 dimensions, resulting in a 40x256 array or a flattened vector of dimension 10240. 
+\item For the contrastive learning, it is suggested that the temporal dimension of the audio is collapsed either by max pooling or by mean pooling, resulting in a vector of length 256. This vector could then be projected in an intermediate space (e.g. 512 dimensions), where the video encoding will also be projected. This space will be the common latent space of the audio and video bites.
+\end{itemize}
+
 \begin{thebibliography}{3}
 
 \bibitem{Diff-Foley}
@@ -165,5 +178,17 @@ S. Chen, C. Wang, Z. Chen, Y. Wu et. al,
 \bibitem{DDPM}
 J. Ho, A. Jain, P. Abbeel,
 ``Denoising Diffusion Probabilistic Models''
+
+\bibitem{VideoMAEv2}
+Wang, Limin and Huang, Bingkun and Zhao, Zhiyu and Tong, Zhan and He, Yinan and Wang, Yi and Wang, Yali and Qiao, Yu,
+``VideoMAE V2: Scaling Video Masked Autoencoders With Dual Masking''
+
+\bibitem{EnCodec}
+A. Défossez, J. Copet, G. Synnaeve, Y. Adi,
+``High Fidelity Neural Audio Compression''
+
+\bibitem{RAVDESS}
+S. R. Livingstone, F. A. Russo,
+``The Ryerson Audio-Visual Database of Emotional Speech and Song (RAVDESS): A dynamic, multimodal set of facial and vocal expressions in North American English.''
 \end{thebibliography}
 \end{document}
