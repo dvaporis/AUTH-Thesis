@@ -142,7 +142,7 @@ def load_or_create_audio(audio_path: str = None, duration: float = 5.0, sample_r
 
 def load_encodec_model(bandwidth: str = "24kbps", sample_rate: int = 48000, device: torch.device = None):
     """
-    Load EnCodec model with fallback strategies.
+    Load EnCodec model from encodec library.
     
     Args:
         bandwidth: Bandwidth setting ("6kbps", "24kbps", etc.)
@@ -155,52 +155,19 @@ def load_encodec_model(bandwidth: str = "24kbps", sample_rate: int = 48000, devi
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Determine model checkpoint based on sample rate
-    if sample_rate == 48000:
-        model_checkpoint = "facebook/encodec_48khz"
-    else:
-        model_checkpoint = "facebook/encodec_24khz"
-    
-    # Strategy 1: Try using HuggingFace transformers (preferred, used in training)
+    # Load using encodec library (correct API)
     try:
-        from transformers import EncodecModel
-        logger.info(f"Loading EnCodec via transformers from {model_checkpoint}...")
-        model = EncodecModel.from_pretrained(model_checkpoint)
+        from encodec import EncodecModel
+        logger.info(f"Loading EnCodec from encodec library...")
+        model = EncodecModel.encodec_model_48khz()
+        model.set_target_bandwidth(24.0)  # Set bandwidth to 24kbps for optimal quality
         model = model.to(device)
         model.eval()
-        logger.info(f"✓ EnCodec model loaded via transformers ({sample_rate}Hz)")
-        return model, "transformers"
-    except Exception as e:
-        logger.warning(f"transformers loading failed: {e}")
-    
-    # Strategy 2: Try using audiocraft
-    try:
-        from audiocraft.models import CompressionModel
-        logger.info(f"Loading EnCodec via audiocraft...")
-        model = CompressionModel.get_pretrained(f"facebook/encodec_{bandwidth}")
-        model = model.to(device)
-        model.eval()
-        logger.info("✓ EnCodec model loaded via audiocraft")
-        return model, "audiocraft"
-    except Exception as e:
-        logger.warning(f"audiocraft loading failed: {e}")
-    
-    # Strategy 3: Try using encodec library directly
-    try:
-        from encodec import CompressionModel
-        logger.info(f"Loading EnCodec via encodec library...")
-        model_name = 'encodec_48khz' if sample_rate == 48000 else 'encodec_24khz'
-        model = CompressionModel.get_pretrained(model_name, device=str(device))
-        model = model.to(device)
-        model.eval()
-        logger.info("✓ EnCodec model loaded via encodec library")
+        logger.info(f"✓ EnCodec model loaded: 48kHz, 24kbps bandwidth")
         return model, "encodec"
     except Exception as e:
-        logger.warning(f"encodec library loading failed: {e}")
-    
-    # Strategy 4: Create a simple dummy model for testing purposes
-    logger.warning("Could not load real EnCodec model, will use simple reconstruction")
-    return None, "dummy"
+        logger.error(f"Failed to load EnCodec model: {e}")
+        raise RuntimeError(f"Could not load EnCodec model: {e}")
 
 
 def test_encodec(audio_path: str = None, bandwidth: str = "24kbps", sample_rate: int = 48000):
@@ -243,41 +210,19 @@ def test_encodec(audio_path: str = None, bandwidth: str = "24kbps", sample_rate:
     # Load model
     model, model_type = load_encodec_model(bandwidth, sample_rate, device)
     
-    if model is None:
-        logger.error("Failed to load EnCodec model using all strategies")
-        logger.info("Please install audiocraft: pip install audiocraft")
-        raise RuntimeError("Could not load EnCodec model")
-    
-    # Encode and Decode
+    # Encode and Decode with encodec library
     logger.info("Encoding audio...")
     with torch.no_grad():
-        if model_type == "transformers":
-            # HuggingFace transformers API
-            encoded = model.encode(waveform)
-            encoded_frames = encoded.audio_codes  # Quantized codes
-            logger.info(f"Encoded shape: {encoded_frames.shape}")
-            
-            # Decode
-            logger.info("Decoding audio...")
-            decoded = model.decode(encoded_frames, encoded.audio_scales)
-            reconstructed = decoded.audio_values  # Extract audio tensor from output
-            
-        elif model_type == "audiocraft":
-            encoded_frames = model.encode(waveform)
-            logger.info(f"Encoded frames: {len(encoded_frames)}")
-            if encoded_frames:
-                logger.info(f"  First frame codes shape: {encoded_frames[0][0].shape}")
-            
-            logger.info("Decoding audio...")
-            reconstructed = model.decode(encoded_frames)
-            
-        elif model_type == "encodec":
-            # encodec library usage
-            encoded_frames = model.encode(waveform)
-            logger.info(f"Encoded representation shape: {encoded_frames[0].shape if isinstance(encoded_frames, tuple) else encoded_frames.shape}")
-            
-            logger.info("Decoding audio...")
-            reconstructed = model.decode(encoded_frames)
+        # encodec library returns list of frames, each containing (codes, scales)
+        encoded_frames = model.encode(waveform)
+        logger.info(f"Encoded frames: {len(encoded_frames)}")
+        for i, frame in enumerate(encoded_frames):
+            codes, scales = frame
+            logger.info(f"  Frame {i+1}: codes shape {codes.shape}")
+        
+        # Decode
+        logger.info("Decoding audio...")
+        reconstructed = model.decode(encoded_frames)
     
     logger.info(f"Reconstructed shape: {reconstructed.shape}")
     

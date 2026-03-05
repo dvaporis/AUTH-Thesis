@@ -18,7 +18,7 @@ from typing import Dict, List
 
 import numpy as np
 import torch
-from transformers import AutoModel
+from encodec import EncodecModel
 
 from test_encodec_with_kaggle import (
     compute_error_metrics,
@@ -46,18 +46,10 @@ def run_single_encoding(
     waveform_batch = waveform.unsqueeze(0) if waveform.dim() == 2 else waveform
 
     with torch.no_grad():
-        encoded = model.encode(waveform_batch)
-        if hasattr(encoded, "audio_codes"):
-            decoded_output = model.decode(encoded.audio_codes, encoded.audio_scales)
-        else:
-            decoded_output = model.decode(encoded)
-
-        if hasattr(decoded_output, "audio_values"):
-            reconstructed = decoded_output.audio_values
-        elif isinstance(decoded_output, tuple):
-            reconstructed = decoded_output[0]
-        else:
-            reconstructed = decoded_output
+        # Encode using audiocraft API
+        encoded_frames = model.encode(waveform_batch)
+        # Decode using audiocraft API
+        reconstructed = model.decode(encoded_frames)
 
     original = waveform_batch.squeeze(0)
     reconstructed = reconstructed.squeeze(0)
@@ -138,11 +130,13 @@ def main() -> int:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
 
-    model_name = "facebook/encodec_48khz" if args.sample_rate == 48000 else "facebook/encodec_24khz"
-    logger.info(f"Loading model once: {model_name}")
-    model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+    logger.info("Loading EnCodec model...")
+    model = EncodecModel.encodec_model_48khz()
+    # Set bandwidth to 24kbps (maximum quality)
+    model.set_target_bandwidth(24.0)
     model.to(device)
     model.eval()
+    logger.info("✓ Model loaded successfully (bandwidth: 24kbps)")
 
     results = []
     for idx, video_path in enumerate(selected_files, start=1):

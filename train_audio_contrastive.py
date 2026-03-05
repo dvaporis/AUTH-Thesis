@@ -481,41 +481,41 @@ class AudioContrastiveModel(nn.Module):
     def __init__(self, config: TrainingConfig):
         super().__init__()
         
-        # Load frozen EnCodec encoder from HuggingFace
+        # Load frozen EnCodec encoder from encodec library
         try:
-            from transformers import EncodecModel
-            self.encodec = EncodecModel.from_pretrained("facebook/encodec_48khz")
-            self.use_hf_encodec = True
-            logger.info("Loaded EnCodec from HuggingFace transformers (48kHz stereo)")
-        except ImportError:
-            # Fallback to audiocraft if transformers not available
-            from audiocraft.models import CompressionModel
-            self.encodec = CompressionModel.get_pretrained('facebook/encodec_48khz')
-            self.use_hf_encodec = False
-            logger.info("Loaded EnCodec from audiocraft (48kHz stereo)")
+            from encodec import EncodecModel
+            self.encodec = EncodecModel.encodec_model_48khz()
+            # Set bandwidth to 24kbps for best reconstruction quality
+            self.encodec.set_target_bandwidth(24.0)
+            logger.info("Loaded EnCodec 48kHz model (bandwidth: 24kbps)")
+        except Exception as e:
+            logger.error(f"Failed to load EnCodec: {e}")
+            logger.error("Make sure encodec library is installed: pip install encodec")
+            raise
         
         # Freeze EnCodec parameters
         for param in self.encodec.parameters():
             param.requires_grad = False
         
-        # Get encoder output dimension
-        # EnCodec produces codes, we'll use the continuous representation before quantization
-        # The encoder output has shape [batch, channels, time]
-        # We'll pool over time to get a fixed-size representation
-        
         # Determine encoder output dimension by running a dummy forward pass
+        # EnCodec produces quantized codes with shape [batch, codebooks, sequence_length]
+        # We'll flatten these to get a fixed-size representation
         with torch.no_grad():
             dummy_num_samples = AudioConfig().num_samples
             dummy_audio = torch.randn(1, 2, dummy_num_samples)
-            if self.use_hf_encodec:
-                # HuggingFace version - use encoder directly for continuous embeddings
-                # Returns [batch, channels, time]
-                encoded = self.encodec.encoder(dummy_audio)
-                encoder_dim = encoded.shape[1] * encoded.shape[2]  # channels * time_steps
-            else:
-                # Audiocraft version
-                encoded = self.encodec.encoder(dummy_audio)
-                encoder_dim = encoded.shape[1] * encoded.shape[2]  # channels * time_steps
+            
+            # Encode to get codes
+            encoded_frames = self.encodec.encode(dummy_audio)
+            logger.info(f"EnCodec encoding produces {len(encoded_frames)} frame(s)")
+            
+            # Flatten all codes and scales
+            total_codes = 0
+            for frame in encoded_frames:
+                codes = frame[0]  # [batch, codebooks, seq_len]
+                total_codes += codes.shape[1] * codes.shape[2]  # codebooks * seq_len
+            
+            encoder_dim = total_codes
+            logger.info(f"Total codes per sample: {encoder_dim}")
         
         # Trainable projection head
         self.projection_head = ProjectionHead(
@@ -534,16 +534,28 @@ class AudioContrastiveModel(nn.Module):
             audio: [batch, channels, samples]
             
         Returns:
-            embeddings: [batch, encoder_dim]
+            embeddings: [batch, total_codes] - flattened quantized codes (float)
         """
         with torch.no_grad():
-            # Use encoder directly to get continuous embeddings [batch, channels, time]
-            encoded = self.encodec.encoder(audio)
-            logger.debug(f"EnCodec encoder raw output shape: {encoded.shape}")
+            # Use EnCodec to encode audio to quantized codes
+            # Returns list of encoded frames, each containing (codes, scales)
+            encoded_frames = self.encodec.encode(audio)
+            logger.debug(f"Number of encoded frames: {len(encoded_frames)}")
             
-            # Flatten temporal and channel dimensions
-            batch_size = encoded.shape[0]
-            embeddings = encoded.reshape(batch_size, -1)
+            # Flatten all codes from all frames
+            batch_size = audio.shape[0]
+            codes_list = []
+            
+            for frame in encoded_frames:
+                codes = frame[0]  # [batch, codebooks, seq_len]
+                # Convert codes to float for projection head
+                codes = codes.float()
+                # Flatten codebooks and seq_len dimensions
+                codes_flat = codes.reshape(batch_size, -1)  # [batch, codebooks*seq_len]
+                codes_list.append(codes_flat)
+            
+            # Concatenate codes from all frames
+            embeddings = torch.cat(codes_list, dim=1)  # [batch, total_codes]
             logger.debug(f"Flattened embeddings shape: {embeddings.shape} (dim={embeddings.shape[1]})")
         
         return embeddings

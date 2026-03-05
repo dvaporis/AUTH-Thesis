@@ -178,6 +178,8 @@ def test_loss_computation():
     logger.info("TEST 4: Loss Computation")
     logger.info("="*60)
     
+    import torch.nn.functional as F
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Create dummy data
@@ -286,10 +288,6 @@ def main():
     logger.info("\n" + "="*60)
     logger.info("AUDIO CONTRASTIVE LEARNING - SETUP VERIFICATION")
     logger.info("="*60)
-    
-    # Import for normalization
-    import torch.nn.functional as F
-    globals()['F'] = F
     
     tests = [
         ("Data Loading", test_data_loading),

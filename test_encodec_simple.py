@@ -195,17 +195,20 @@ def test_encodec_with_compression(audio_path: str = None):
     logger.info(f"Using device: {device}")
     waveform = waveform.to(device)
     
-    # Try to load real EnCodec model
+    # Load real EnCodec model directly using encodec library
     try:
-        from transformers import AutoModel
-        logger.info("Loading EnCodec model from HuggingFace...")
-        model_name = "facebook/encodec_48khz" if sample_rate == 48000 else "facebook/encodec_24khz"
-        logger.info(f"Using model: {model_name}")
-        model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+        from encodec import EncodecModel
+        logger.info("Loading EnCodec model...")
+        
+        # Create the EnCodec model with maximum bandwidth for best reconstruction
+        model = EncodecModel.encodec_model_48khz()
+        # Set bandwidth to 24kbps (maximum quality, supports 1.5/3/6/12/24)
+        model.set_target_bandwidth(24.0)
         model.to(device)
         model.eval()
+        logger.info("✓ EnCodec 48kHz model loaded successfully (bandwidth: 24kbps)")
         
-        # Add batch dim
+        # Add batch dim if needed
         if waveform.dim() == 2:
             waveform_batch = waveform.unsqueeze(0)
         else:
@@ -213,54 +216,27 @@ def test_encodec_with_compression(audio_path: str = None):
         
         logger.info(f"Model input shape: {waveform_batch.shape}")
         
-        # Encode
+        # Encode and Decode
         logger.info("Encoding audio...")
         with torch.no_grad():
             # Encode to codes
-            encoded = model.encode(waveform_batch)
-            logger.info(f"Encoded output: {type(encoded)}")
-            if hasattr(encoded, 'audio_codes'):
-                logger.info(f"  Codes shape: {encoded.audio_codes.shape}")
-            elif isinstance(encoded, tuple):
-                logger.info(f"  Codes shape: {encoded[0].shape}")
-            elif hasattr(encoded, 'shape'):
-                logger.info(f"  Codes shape: {encoded.shape}")
+            encoded_frames = model.encode(waveform_batch)
+            logger.info(f"Encoded frames: {len(encoded_frames)} frame(s)")
             
-            # Decode back
+            # Decode back from codes
             logger.info("Decoding audio...")
-            if hasattr(encoded, 'audio_codes'):
-                decoded_output = model.decode(encoded.audio_codes, encoded.audio_scales)
-            else:
-                decoded_output = model.decode(encoded)
-            
-            # Extract audio from decoder output
-            if hasattr(decoded_output, 'audio_values'):
-                reconstructed = decoded_output.audio_values
-            elif isinstance(decoded_output, tuple):
-                reconstructed = decoded_output[0]
-            else:
-                reconstructed = decoded_output
+            reconstructed = model.decode(encoded_frames)
         
         logger.info(f"Reconstructed shape: {reconstructed.shape}")
         
-        # Remove batch dim
+        # Remove batch dim and ensure same shape
         original = waveform_batch.squeeze(0)
         reconstructed = reconstructed.squeeze(0)
         
     except Exception as e:
-        logger.warning(f"Real model loading failed: {e}")
-        logger.info("Using simple reconstruction simulation...")
-        
-        # Simulate compression by taking only key frames
-        # This is a simulation of what EnCodec does
-        original = waveform.squeeze(0) if waveform.dim() > 2 else waveform
-        
-        # Simulate reconstruction with some quantization loss
-        # EnCodec uses vector quantization, we'll simulate with a simple quantization
-        compression_ratio = 0.1  # Simulate some loss
-        reconstructed = original + (torch.randn_like(original) * compression_ratio)
-        
-        logger.warning("Using simulated compression (not real EnCodec)")
+        logger.error(f"Failed to load EnCodec model: {e}")
+        logger.error("Make sure encodec library is properly installed: pip install encodec")
+        raise
     
     # Compute metrics
     logger.info("\nComputing error metrics...")

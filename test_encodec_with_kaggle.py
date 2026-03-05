@@ -68,7 +68,7 @@ def find_kaggle_audio_files(kaggle_dir: str = "kaggle_datasets") -> list:
 
 def load_or_create_audio(audio_path: Optional[str] = None, duration: float = 5.0,
                          sample_rate: int = 48000, num_samples: Optional[int] = None,
-                         num_video_frames: int = 16) -> Tuple[torch.Tensor, int, float, str]:
+                         num_video_frames: int = 16, full_audio: bool = False) -> Tuple[torch.Tensor, int, float, str]:
     """
     Load audio from audio/video file or create a test signal.
     Supports extracting audio from MP4 videos using PyAV.
@@ -81,6 +81,7 @@ def load_or_create_audio(audio_path: Optional[str] = None, duration: float = 5.0
         sample_rate: Sample rate in Hz
         num_samples: Optional explicit sample count override
         num_video_frames: Number of video frames represented by each audio bite
+        full_audio: If True, load entire audio file without frame-alignment limitation
     
     Returns:
         Tuple of (waveform, sample_rate, duration_seconds, source_description)
@@ -207,20 +208,26 @@ def load_or_create_audio(audio_path: Optional[str] = None, duration: float = 5.0
                 logger.info(f"Trimming audio to 30 seconds...")
                 waveform = waveform[:, :max_samples]
             
-            # Extract frame-aligned target samples
-            if waveform.shape[1] > target_num_samples:
-                logger.info(
-                    f"Extracting {target_num_samples} samples "
-                    f"({target_num_samples/sample_rate:.3f}s target duration)..."
-                )
-                # Take a random segment from the audio
-                max_start = waveform.shape[1] - target_num_samples
-                start_idx = random.randint(0, max_start) if max_start > 0 else 0
-                waveform = waveform[:, start_idx:start_idx + target_num_samples]
+            # Extract frame-aligned target samples (unless full_audio is requested)
+            if not full_audio:
+                if waveform.shape[1] > target_num_samples:
+                    logger.info(
+                        f"Extracting {target_num_samples} samples "
+                        f"({target_num_samples/sample_rate:.3f}s target duration)..."
+                    )
+                    # Take a random segment from the audio
+                    max_start = waveform.shape[1] - target_num_samples
+                    start_idx = random.randint(0, max_start) if max_start > 0 else 0
+                    waveform = waveform[:, start_idx:start_idx + target_num_samples]
+                else:
+                    logger.warning(
+                        f"Audio shorter than target bite ({target_num_samples} samples, "
+                        f"{waveform.shape[1]} available)"
+                    )
             else:
-                logger.warning(
-                    f"Audio shorter than target bite ({target_num_samples} samples, "
-                    f"{waveform.shape[1]} available)"
+                logger.info(
+                    f"Loading full audio file: {waveform.shape[1]} samples "
+                    f"({waveform.shape[1]/sample_rate:.3f}s)"
                 )
             
             # Calculate actual duration based on extracted samples
@@ -338,7 +345,7 @@ def compute_error_metrics(original: torch.Tensor, reconstructed: torch.Tensor) -
 
 
 def test_encodec_with_audio(audio_path: Optional[str] = None, use_kaggle: bool = False,
-                            num_video_frames: int = 16):
+                            num_video_frames: int = 16, full_audio: bool = False):
     """
     Test EnCodec encoder-decoder with real or generated audio.
     
@@ -346,9 +353,13 @@ def test_encodec_with_audio(audio_path: Optional[str] = None, use_kaggle: bool =
         audio_path: Path to audio file (optional)
         use_kaggle: Whether to use a random file from Kaggle dataset
         num_video_frames: Number of video frames represented by each audio bite
+        full_audio: If True, use entire audio file instead of frame-aligned extraction
     """
     logger.info("="*70)
-    logger.info(f"Testing EnCodec Audio Codec (Frame-Aligned: {num_video_frames} video frames)")
+    if full_audio:
+        logger.info("Testing EnCodec Audio Codec (Full Audio)")
+    else:
+        logger.info(f"Testing EnCodec Audio Codec (Frame-Aligned: {num_video_frames} video frames)")
     logger.info("="*70)
     
     # Determine audio to test
@@ -364,7 +375,8 @@ def test_encodec_with_audio(audio_path: Optional[str] = None, use_kaggle: bool =
     # Load audio
     waveform, sample_rate, duration_seconds, source_desc = load_or_create_audio(
         audio_path,
-        num_video_frames=num_video_frames
+        num_video_frames=num_video_frames,
+        full_audio=full_audio
     )
     
     logger.info(f"Audio shape: {waveform.shape}, Sample rate: {sample_rate}Hz")
@@ -383,18 +395,21 @@ def test_encodec_with_audio(audio_path: Optional[str] = None, use_kaggle: bool =
     
     logger.info(f"Batch shape: {waveform_batch.shape}")
     
-    # Load EnCodec model
+    # Load EnCodec model directly using encodec library
     try:
-        from transformers import AutoModel
-        logger.info("\nLoading EnCodec model from HuggingFace...")
-        model_name = "facebook/encodec_48khz" if sample_rate == 48000 else "facebook/encodec_24khz"
-        logger.info(f"Using model: {model_name}")
-        model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+        from encodec import EncodecModel
+        logger.info("\nLoading EnCodec model...")
+        
+        # Create the EnCodec model with maximum bandwidth for best reconstruction
+        model = EncodecModel.encodec_model_48khz()
+        # Set bandwidth to 24kbps (maximum quality, supports 1.5/3/6/12/24)
+        model.set_target_bandwidth(24.0)
         model.to(device)
         model.eval()
-        logger.info("✓ Model loaded successfully")
+        logger.info("✓ EnCodec 48kHz model loaded successfully (bandwidth: 24kbps)")
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
+        logger.error("Make sure encodec library is properly installed: pip install encodec")
         raise
     
     # Encode and reconstruct
@@ -402,33 +417,27 @@ def test_encodec_with_audio(audio_path: Optional[str] = None, use_kaggle: bool =
     with torch.no_grad():
         # Encode
         logger.info("  Encoding...")
-        encoded = model.encode(waveform_batch)
-        if hasattr(encoded, 'audio_codes'):
-            logger.info(f"  ✓ Encoded to codes: {encoded.audio_codes.shape}")
-        else:
-            logger.info(f"  ✓ Encoded (type: {type(encoded).__name__})")
+        encoded_frames = model.encode(waveform_batch)
+        logger.info(f"  ✓ Encoded to {len(encoded_frames)} frame(s)")
+        
+        # Log embedding dimensions
+        logger.info(f"\n  Embedding Details:")
+        for i, frame in enumerate(encoded_frames):
+            logger.info(f"    Frame {i+1}: codes shape = {frame[0].shape}, scale shape = {frame[1].shape if len(frame) > 1 else 'N/A'}")
         
         # Decode
         logger.info("  Decoding...")
-        if hasattr(encoded, 'audio_codes'):
-            # HuggingFace model format
-            decoded_output = model.decode(encoded.audio_codes, encoded.audio_scales)
-        else:
-            decoded_output = model.decode(encoded)
-        
-        # Extract audio from decoder output
-        if hasattr(decoded_output, 'audio_values'):
-            reconstructed = decoded_output.audio_values
-        elif isinstance(decoded_output, tuple):
-            reconstructed = decoded_output[0]
-        else:
-            reconstructed = decoded_output
-        
+        reconstructed = model.decode(encoded_frames)
         logger.info(f"  ✓ Reconstructed: {reconstructed.shape}")
     
     # Prepare for metrics
     original = waveform_batch.squeeze(0)
     reconstructed = reconstructed.squeeze(0)
+    
+    # Trim reconstructed to match original length (EnCodec may pad to frame boundaries)
+    if reconstructed.shape[-1] > original.shape[-1]:
+        logger.info(f"  Trimming reconstructed from {reconstructed.shape[-1]} to {original.shape[-1]} samples to match original length")
+        reconstructed = reconstructed[..., :original.shape[-1]]
     
     # Compute metrics
     logger.info("\nComputing error metrics...")
@@ -487,11 +496,11 @@ def visualize_results(original: np.ndarray, reconstructed: np.ndarray,
     """
     logger.info("\nCreating visualizations...")
     
-    # Flatten if needed
+    # Take first channel if stereo, don't flatten all channels together
     if original.ndim > 1:
-        original = original.flatten()
+        original = original[0]  # Take first channel
     if reconstructed.ndim > 1:
-        reconstructed = reconstructed.flatten()
+        reconstructed = reconstructed[0]  # Take first channel
     
     min_len = min(len(original), len(reconstructed))
     original = original[:min_len]
@@ -518,11 +527,10 @@ def visualize_results(original: np.ndarray, reconstructed: np.ndarray,
     axes[1].legend()
     axes[1].grid(True, alpha=0.3)
     
-    # Spectrum
-    max_samples = min(len(original), 3 * sample_rate)
-    original_spec = np.abs(np.fft.rfft(original[:max_samples]))
-    reconstructed_spec = np.abs(np.fft.rfft(reconstructed[:max_samples]))
-    freqs = np.fft.rfftfreq(max_samples, 1/sample_rate)
+    # Spectrum - use actual audio length, no padding
+    original_spec = np.abs(np.fft.rfft(original))
+    reconstructed_spec = np.abs(np.fft.rfft(reconstructed))
+    freqs = np.fft.rfftfreq(len(original), 1/sample_rate)
     
     axes[2].semilogy(freqs, original_spec, label='Original', alpha=0.7, linewidth=0.8)
     axes[2].semilogy(freqs, reconstructed_spec, label='Reconstructed', alpha=0.7, linewidth=0.8)
@@ -573,6 +581,8 @@ if __name__ == "__main__":
                        help="Duration for generated test signal")
     parser.add_argument("--num-video-frames", type=int, default=16,
                        help="Number of video frames represented by each audio bite")
+    parser.add_argument("--full-audio", action="store_true",
+                       help="Load and process entire audio file (ignores --num-video-frames)")
     
     args = parser.parse_args()
     
@@ -580,7 +590,8 @@ if __name__ == "__main__":
         metrics = test_encodec_with_audio(
             audio_path=args.audio,
             use_kaggle=args.use_kaggle,
-            num_video_frames=args.num_video_frames
+            num_video_frames=args.num_video_frames,
+            full_audio=args.full_audio
         )
         logger.info("\n" + "="*70)
         logger.info("✓ EnCodec test completed successfully!")
