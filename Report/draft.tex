@@ -104,7 +104,7 @@ The method proposed is very similar to the one proposed in Diff-Foley \cite{Diff
 \item Possible conversion to Grayscale instead of RGB to further reduce the data incorporated.
 \item Masking: Two forms of masking are possible, temporal and spatial. Temporal masking involves adding noise to (or completely covering) a relatively small number of frames of the video bite in their entirety, whereas spatial masking constitutes of adding noise to specific areas of the video bite (i.e. near the left part of the lip) for the entire video bite (or, again, covering/removing them entirely).
 \end{itemize}
-The final processed data is passed into the Video Encoder (i.e. VideoMAE \cite{VideoMAE}, works with a high masking percentage). Meta's VideoMAE v2 base model from Hugging Face was chosen \cite{VideoMAEv2}.
+The final processed data is passed into the Video Encoder (i.e. VideoMAE \cite{VideoMAE}, works with a high masking percentage).
 
 (6): The audio is also processed and encoded, using the Mel-spectogram. A Pre-trained Audio Variational Autoencoder (VAE) is used, since it is trained to both encode and decode to and from the resulting latent space, while retaining phase information (crucial for correct reconstruction and alignment of lip movements and sounds generated). Examples of architectures to be considered: HTS-AT \cite{HTS-AT} or the VAE used in AudioLDM \cite{AudioLDM}. Due to issues with the dependencies of the video encoder alongside the audio encoder, EnCodec from Meta was chosen \cite{EnCodec}.
 
@@ -148,14 +148,14 @@ Some key observations crucial to the understanding of the results below are show
 
 \begin{itemize}
 \item The dataset chosen for this purpose is RAVDESS \cite{RAVDESS}, which contains both videos and pure audio of actors speaking or singing specific phrases. The videos are .mp4 files with resolution 1280×720, a framerate of 29.97 fps and stereo sound (which is ignored since pure audio files are also contained in the dataset). The audio files are .wav.
-\item The video encoder VideoMAE v2 \cite{VideoMAEv2} produces a 768-dimensional vector embedding per 16-frame video segment. At 29.97 fps, this results in video bites with length around 0.534 seconds. Importantly, the video encoder does not provide a meaningful decoding from the embedding space, meaning the opposite reconstruction (video of speech from audio) is impossible with the current setup. 
+\item The video encoder VideoMAE \cite{VideoMAE} produces a 768-dimensional vector embedding per 16-frame video segment. At 29.97 fps, this results in video bites with length around 0.534 seconds. Importantly, the video encoder does not provide a meaningful decoding from the embedding space, meaning the opposite reconstruction (video of speech from audio) is impossible with the current setup. 
 \item The audio VAE \cite{EnCodec} receives stereo 48kHz audio (the audio files are actually mono because they are created from the mp4 files of the videos for perfect alignment, but the samples are cloned to use the stereo model), which for a duration of about 0.534s amounts to 25626 samples, returning a matrix that leads to a flattened vector of dimension 1296 (a compression of a factor close to 20). This number is the result of this operation: 25626 (total samples in audio bite) / 320 samples/frame $\approx$ 80 frames (rounding up to 81), with each frame encoded in 16 dimensions, resulting in a 16x81 array or a flattened vector of dimension 1296. 
 \item For the contrastive learning, it is suggested that a fully connected layer is used to project from the initial 1296-dimension vector to an intermediate dimensional space and then to the latent space, which will be the common embedding space for audio and video.
 \end{itemize}
 
 \subsection{Testing the video encoder and the audio encoder-decoder}
 
-Since the video encoder \cite{VideoMAEv2} does not include a meaningful decoder from the 768-dimensional space it maps videos to, only the ability to encode video segments (either generated or from the dataset) was tested in this part. This introductory test was meant as a way to interpret the resulting dimensional space from the encoding, as well as familiarize with the usage of the video encoding process. 
+Since the video encoder \cite{VideoMAE} does not include a meaningful decoder from the 768-dimensional space it maps videos to, only the ability to encode video segments (either generated or from the dataset) was tested in this part. This introductory test was meant as a way to interpret the resulting dimensional space from the encoding, as well as familiarize with the usage of the video encoding process. 
 
 As part of this first stage of testing, a handful of audio encoding-decoding tests were conducted. To start, entire audio files were encoded and decoded with the EnCodec \cite{EnCodec} quite successfully. Some indicative results are presented below:
 
@@ -209,8 +209,25 @@ The encoder showcases a very accurate reconstruction ability, with very low erro
 	\caption{Metrics of reconstruction of 2nd segmented test audio file}
 \end{figure}
 
-Even with this smaller audio length to work with, the encoder-decoder manages very pleasing results, with extremely high similarity scores and SNR's, while keeping reconstruction error metrics very low. 
+Even with this smaller audio length to work with, the encoder-decoder manages very pleasing results, with extremely high similarity scores and SNR's, while keeping reconstruction error metrics very low.
 
+\subsection{Testing audio and video alignment}
+
+In order to ensure proper temporal alignment of the video and audio bites (length of 16 frames, around 0.534s), a separate testing script was created. This script showcases the complete pipeline of reaching a video from the kaggle dataset, extracting 16 frames from it and ensuring that the resulting video and audio are properly aligned temporally. The results are shown below:
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{Alignment1.png}
+	\caption{Temporal alignment of 1st test video file}
+\end{figure}
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{Alignment2.png}
+	\caption{Temporal alignment of 2nd test video file}
+\end{figure}
+
+Obviously the correctness of the results cannot be proven with the provided figures, but they serve as an illustration of the subjective correctness the alignment of the files themselves display.
 \begin{thebibliography}{3}
 
 \bibitem{Diff-Foley}
