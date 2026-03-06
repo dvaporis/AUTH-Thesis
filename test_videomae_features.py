@@ -1,7 +1,7 @@
 """
-Extract visual features from videos using VideoMAEv2.
+Extract visual features from videos using VideoMAE.
 
-This script uses Meta's VideoMAEv2 model from HuggingFace to extract video embeddings
+This script uses MCG-NJU's VideoMAE model from HuggingFace to extract video embeddings
 from 16-frame chunks (no frame cloning), compatible with contrastive learning.
 
 Usage:
@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 def find_kaggle_video_files() -> list:
-    """Find all video files in the Kaggle dataset directory."""
+    """Find Kaggle video files that start with '01' (exclude muted '02' files)."""
     import os
     
     possible_paths = [
@@ -41,11 +41,11 @@ def find_kaggle_video_files() -> list:
     for kaggle_path in possible_paths:
         if kaggle_path.exists():
             for file in kaggle_path.rglob("*"):
-                if file.suffix.lower() in video_extensions:
+                if file.suffix.lower() in video_extensions and file.name.startswith("01"):
                     video_files.append(file)
             
             if video_files:
-                logger.info(f"Found {len(video_files)} video files in {kaggle_path}")
+                logger.info(f"Found {len(video_files)} video files with '01' prefix in {kaggle_path}")
                 break
     
     return video_files
@@ -126,7 +126,7 @@ def load_video_frames(video_path: str, num_frames: int = 16, start_frame: Option
 
 def load_videomae_model(device: str = "cpu"):
     """
-    Load VideoMAEv2 model from HuggingFace.
+    Load VideoMAE model from HuggingFace.
     
     Args:
         device: Device to use (cpu or cuda)
@@ -134,23 +134,26 @@ def load_videomae_model(device: str = "cpu"):
     Returns:
         Model and image processor
     """
-    logger.info("Loading VideoMAEv2 model from HuggingFace...")
+    logger.info("Loading VideoMAE model from HuggingFace...")
     
     try:
         from transformers import VideoMAEImageProcessor, VideoMAEModel
         
-        # Load VideoMAE v2 base model
+        # Load VideoMAE base model
         model_name = "MCG-NJU/videomae-base"
         
         logger.info(f"Loading model: {model_name}")
-        
         processor = VideoMAEImageProcessor.from_pretrained(model_name)
         model = VideoMAEModel.from_pretrained(model_name)
+        
+        # Verify we loaded the correct architecture
+        model_class = type(model).__name__
+        logger.info(f"✓ Loaded model architecture: {model_class}")
         
         model = model.to(device)
         model.eval()
         
-        logger.info("✓ VideoMAEv2 model loaded successfully")
+        logger.info("✓ VideoMAE model loaded successfully")
         logger.info(f"  Input size: {processor.size}")
         
         return model, processor
@@ -164,7 +167,7 @@ def load_videomae_model(device: str = "cpu"):
 
 def extract_video_features(frames: np.ndarray, model, processor, device: str = "cpu") -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Extract video features using VideoMAEv2.
+    Extract video features using VideoMAE.
     
     Args:
         frames: Video frames [T, H, W, 3]
@@ -175,7 +178,7 @@ def extract_video_features(frames: np.ndarray, model, processor, device: str = "
     Returns:
         Tuple of (video_embedding, sequence_features)
     """
-    logger.info("Extracting video features with VideoMAEv2...")
+    logger.info("Extracting video features with VideoMAE...")
     
     try:
         # VideoMAE expects list of frames in [0, 255] range (uint8)
@@ -184,17 +187,17 @@ def extract_video_features(frames: np.ndarray, model, processor, device: str = "
         
         logger.info(f"Processing {len(frames_list)} frames")
         
-        # Preprocess frames - processor expects uint8 [0, 255] images
+        # Preprocess frames
         inputs = processor(frames_list, return_tensors="pt")
         
-        # Move to device
-        pixel_values = inputs['pixel_values'].to(device)
+        logger.info(f"Processor output shape: {tuple(inputs['pixel_values'].shape)}")
         
-        logger.info(f"Input tensor shape: {pixel_values.shape}")
+        # Move to device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
         
         # Extract features
         with torch.no_grad():
-            outputs = model(pixel_values)
+            outputs = model(**inputs)
         
         # Get the last hidden state (sequence of patch embeddings)
         sequence_output = outputs.last_hidden_state  # [batch, num_patches, hidden_size]
@@ -234,7 +237,7 @@ def visualize_results(video_embedding: torch.Tensor, sequence_features: torch.Te
     
     # Create visualization
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle(f'VideoMAEv2 Features: {video_name}', fontsize=14, fontweight='bold')
+    fig.suptitle(f'VideoMAE Features: {video_name}', fontsize=14, fontweight='bold')
     
     # Plot 1: Video embedding distribution
     axes[0, 0].hist(embed_np.flatten(), bins=50, alpha=0.7, color='steelblue', edgecolor='black')
@@ -282,7 +285,7 @@ def visualize_results(video_embedding: torch.Tensor, sequence_features: torch.Te
 def main(video_path: Optional[str] = None):
     """Main function."""
     logger.info("="*70)
-    logger.info("VideoMAEv2 Visual Feature Extraction (16-frame chunks)")
+    logger.info("VideoMAE Visual Feature Extraction (16-frame chunks)")
     logger.info("="*70)
     
     # Load video
@@ -293,6 +296,12 @@ def main(video_path: Optional[str] = None):
             return
         video_path = random.choice(video_files)
         logger.info(f"Using random Kaggle video: {video_path}")
+    elif not Path(video_path).name.startswith("01"):
+        logger.error(
+            "Only videos with filenames starting with '01' are supported; "
+            "'02' files are muted."
+        )
+        return
     
     # Load exactly 16 consecutive frames (no cloning)
     frames, duration_seconds, source_desc = load_video_frames(video_path, num_frames=16)
@@ -324,13 +333,13 @@ def main(video_path: Optional[str] = None):
     # Visualize
     visualize_results(video_embedding, sequence_features, Path(video_path).name)
     
-    logger.info("\n✓ VideoMAEv2 visual feature extraction completed!")
+    logger.info("\n✓ VideoMAE visual feature extraction completed!")
     logger.info(f"  Video embedding dimension: {video_embedding.shape[1]}")
     logger.info("  Ready for contrastive learning with audio embeddings!")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="VideoMAEv2 visual feature extraction")
+    parser = argparse.ArgumentParser(description="VideoMAE visual feature extraction")
     parser.add_argument("--use-kaggle", action="store_true", help="Use random Kaggle video")
     parser.add_argument("--video", type=str, help="Path to specific video file")
     

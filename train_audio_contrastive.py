@@ -739,7 +739,7 @@ def extract_audio_from_video(video_path: Path, target_sr: int = 48000) -> Tuple[
 
 
 def find_kaggle_audio_files() -> List[Path]:
-    """Find video files (01-*.mp4) from Kaggle dataset - extracts audio from videos only."""
+    """Find video files (01*.mp4) from Kaggle dataset - extracts audio from videos only."""
     import os
     
     possible_paths = [
@@ -752,21 +752,21 @@ def find_kaggle_audio_files() -> List[Path]:
     
     for kaggle_path in possible_paths:
         if kaggle_path.exists():
-            # Find video files starting with "01-" (speech videos with audio)
+            # Find video files starting with "01" (speech videos with audio)
             video_extensions = ['.mp4', '.avi', '.mov', '.mkv']
             all_videos = []
             for ext in video_extensions:
                 all_videos.extend(kaggle_path.rglob(f"*{ext}"))
             
-            # Filter to only "01-" prefix (speech videos with embedded audio)
-            video_files = [v for v in all_videos if v.name.startswith('01-')]
+            # Filter to only "01" prefix (speech videos with embedded audio)
+            video_files = [v for v in all_videos if v.name.startswith('01')]
             
             if video_files:
-                logger.info(f"Found {len(video_files)} speech video files (01-*.mp4, will extract audio) in {kaggle_path}")
+                logger.info(f"Found {len(video_files)} speech video files (01*.mp4, will extract audio) in {kaggle_path}")
                 break
     
     if not video_files:
-        logger.warning("No video files with '01-' prefix found! Ensure Kaggle dataset is downloaded.")
+        logger.warning("No video files with '01' prefix found! Ensure Kaggle dataset is downloaded.")
     
     return video_files
 

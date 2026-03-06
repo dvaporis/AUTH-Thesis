@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 def find_kaggle_videos() -> list:
-    """Find all video files in the Kaggle dataset."""
+    """Find Kaggle video files that start with '01' (exclude muted '02' files)."""
     import os
     
     possible_paths = [
@@ -50,11 +50,15 @@ def find_kaggle_videos() -> list:
         if search_path.exists():
             logger.info(f"Searching in: {search_path}")
             for file in search_path.rglob("*"):
-                if file.is_file() and file.suffix.lower() in video_extensions:
+                if (
+                    file.is_file()
+                    and file.suffix.lower() in video_extensions
+                    and file.name.startswith("01")
+                ):
                     video_files.append(file)
             
             if video_files:
-                logger.info(f"Found {len(video_files)} video files")
+                logger.info(f"Found {len(video_files)} video files with '01' prefix")
                 break
     
     return video_files
@@ -292,20 +296,26 @@ def extract_aligned_video_audio(
 
 
 def load_videomae_model(device: str = "cpu"):
-    """Load VideoMAEv2 model from HuggingFace."""
-    logger.info("\nLoading VideoMAEv2 model...")
+    """Load VideoMAE model from HuggingFace."""
+    logger.info("\nLoading VideoMAE model...")
     
     try:
         from transformers import VideoMAEImageProcessor, VideoMAEModel
         
         model_name = "MCG-NJU/videomae-base"
+        logger.info(f"Loading {model_name}...")
+        
         processor = VideoMAEImageProcessor.from_pretrained(model_name)
         model = VideoMAEModel.from_pretrained(model_name)
+        
+        # Verify we loaded VideoMAE
+        model_class = type(model).__name__
+        logger.info(f"✓ Loaded model architecture: {model_class}")
         
         model = model.to(device)
         model.eval()
         
-        logger.info(f"  ✓ VideoMAEv2 loaded: {model_name}")
+        logger.info(f"  ✓ VideoMAE loaded: {model_name}")
         return model, processor
         
     except Exception as e:
@@ -314,17 +324,21 @@ def load_videomae_model(device: str = "cpu"):
 
 
 def extract_video_features(frames: np.ndarray, model, processor, device: str = "cpu") -> torch.Tensor:
-    """Extract video features using VideoMAEv2."""
+    """Extract video features using VideoMAE."""
     logger.info("\nExtracting video features...")
     
-    # Prepare frames
+    # Prepare frames for processor
     frames_list = [frames[i] for i in range(frames.shape[0])]
     inputs = processor(frames_list, return_tensors="pt")
-    pixel_values = inputs['pixel_values'].to(device)
+    
+    logger.info(f"Processor output shape: {tuple(inputs['pixel_values'].shape)}")
+    
+    # Move to device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
     
     # Extract features
     with torch.no_grad():
-        outputs = model(pixel_values)
+        outputs = model(**inputs)
     
     # Get CLS token as video embedding
     video_embedding = outputs.last_hidden_state[:, 0, :]
@@ -434,6 +448,12 @@ def main(video_path: Optional[str] = None,
         # Use provided path
         if not Path(video_path).exists():
             logger.error(f"Video file not found: {video_path}")
+            return
+        if not Path(video_path).name.startswith("01"):
+            logger.error(
+                "Only videos with filenames starting with '01' are supported; "
+                "'02' files are muted."
+            )
             return
     
     # Extract aligned video frames and audio
