@@ -22,7 +22,7 @@ import logging
 from train_audio_contrastive import (
     AudioConfig, TrainingConfig, AudioAugmentation,
     AudioChunkDataset, AudioContrastiveModel, ContrastiveLoss,
-    find_kaggle_audio_files, split_dataset
+    find_kaggle_audio_files, split_dataset, get_video_fps
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -47,6 +47,27 @@ def test_data_loading():
     
     # Test dataset creation
     audio_config = AudioConfig()
+
+    # Match alignment rule: duration = num_frames / fps from video stream.
+    aligned_fps = get_video_fps(audio_files[0], fallback_fps=audio_config.reference_video_fps)
+    expected_duration = audio_config.num_video_frames / aligned_fps
+    audio_config.reference_video_fps = aligned_fps
+    audio_config.num_samples = int(round(audio_config.sample_rate * expected_duration))
+    audio_config.stride = int(round(audio_config.num_samples * (1.0 - audio_config.overlap)))
+    audio_config.update_derived_params()
+
+    segment_duration = audio_config.chunk_duration_seconds
+    logger.info(
+        f"✓ Segment duration: {segment_duration:.6f}s "
+        f"(alignment target={expected_duration:.6f}s, fps={aligned_fps:.5f})"
+    )
+    if abs(segment_duration - expected_duration) > (1.0 / audio_config.sample_rate):
+        logger.error(
+            f"❌ Segment duration mismatch: got {segment_duration:.6f}s, "
+            f"expected {expected_duration:.6f}s"
+        )
+        return False
+
     train_files, val_files, test_files = split_dataset(audio_files[:10])  # Use only 10 files for quick test
     
     dataset = AudioChunkDataset(train_files, audio_config, augment=False)
@@ -102,6 +123,7 @@ def test_augmentation():
         ("Brown Noise", lambda: augmentation.add_colored_noise(audio, 'brown')),
         ("Impulse Noise", lambda: augmentation.add_impulse_noise(audio)),
         ("Time Stretch", lambda: augmentation.time_stretch(audio)),
+        ("Time Squeeze (Zero-Pad)", lambda: augmentation.time_squeeze(audio)),
         ("Phase Shift", lambda: augmentation.phase_shift(audio)),
     ]
     
@@ -119,7 +141,17 @@ def test_augmentation():
     for idx, (name, aug_func) in enumerate(tests, start=1):
         try:
             aug_audio = aug_func()
-            axes[idx].plot(t[:1000], aug_audio[0, :1000].numpy())
+
+            # Time squeeze adds zero-padding at both sides by design, so plot near center.
+            if 'Squeeze' in name:
+                center = audio_config.num_samples // 2
+                half_window = 500
+                start = max(0, center - half_window)
+                end = min(audio_config.num_samples, center + half_window)
+                axes[idx].plot(t[start:end], aug_audio[0, start:end].numpy())
+            else:
+                axes[idx].plot(t[:1000], aug_audio[0, :1000].numpy())
+
             axes[idx].set_title(name)
             axes[idx].set_xlabel('Time (s)')
             axes[idx].set_ylabel('Amplitude')

@@ -46,7 +46,7 @@ class AudioConfig:
     """Configuration for audio processing."""
     sample_rate: int = 48000  # EnCodec 48kHz stereo
     num_video_frames: int = 16  # target bite length in video frames
-    reference_video_fps: float = 30.0  # fallback fps when exact fps is unavailable
+    reference_video_fps: float = 30000 / 1001  # NTSC-like fps used by many videos (~29.97)
     num_samples: Optional[int] = None  # derived from frames/fps if None
     overlap: float = 0.5  # 50% overlap
     stride: Optional[int] = None  # derived from overlap if None
@@ -64,6 +64,10 @@ class AudioConfig:
     mixup_alpha: float = 0.3  # For manifold mixup
 
     def __post_init__(self):
+        self.update_derived_params()
+
+    def update_derived_params(self):
+        """Recompute derived timing parameters from frames/fps settings."""
         if self.num_samples is None:
             self.num_samples = int(round(self.sample_rate * self.num_video_frames / self.reference_video_fps))
 
@@ -73,6 +77,11 @@ class AudioConfig:
         if self.stride is None:
             self.stride = int(round(self.num_samples * (1.0 - self.overlap)))
         self.stride = max(1, int(self.stride))
+
+    @property
+    def chunk_duration_seconds(self) -> float:
+        """Audio segment duration in seconds (target is about 0.534s for 16/30 fps)."""
+        return self.num_samples / float(self.sample_rate)
 
 
 @dataclass
@@ -194,11 +203,40 @@ class AudioAugmentation:
             # Crop
             resampled = resampled[..., :original_length]
         else:
-            # Pad
+            # Stretch should not inject silence: pad with edge values instead of zeros.
             pad_length = original_length - stretched_length
-            resampled = np.pad(resampled, ((0, 0), (0, pad_length)), mode='constant')
+            resampled = np.pad(resampled, ((0, 0), (0, pad_length)), mode='edge')
         
         return torch.from_numpy(resampled).to(audio.device)
+
+    def time_squeeze(self, audio: torch.Tensor, squeeze_factor: float = None) -> torch.Tensor:
+        """
+        Squeeze audio in time, then place it in the center with zeros on both sides.
+
+        Args:
+            audio: Audio tensor [channels, samples]
+            squeeze_factor: Compression factor in (0, 1). If None, sampled randomly.
+
+        Returns:
+            Audio tensor with original length and centered zero-padding.
+        """
+        if squeeze_factor is None:
+            squeeze_factor = random.uniform(0.6, 0.95)
+
+        squeeze_factor = float(np.clip(squeeze_factor, 0.05, 0.99))
+
+        audio_np = audio.cpu().numpy()
+        original_length = audio_np.shape[-1]
+        squeezed_length = max(1, int(round(original_length * squeeze_factor)))
+
+        squeezed = scipy_signal.resample(audio_np, squeezed_length, axis=-1)
+
+        pad_length = original_length - squeezed_length
+        left_pad = pad_length // 2
+        right_pad = pad_length - left_pad
+        squeezed_padded = np.pad(squeezed, ((0, 0), (left_pad, right_pad)), mode='constant')
+
+        return torch.from_numpy(squeezed_padded).to(audio.device)
     
     def phase_shift(self, audio: torch.Tensor, shift: float = None) -> torch.Tensor:
         """Apply phase shift in frequency domain."""
@@ -756,6 +794,22 @@ def extract_audio_from_video(video_path: Path, target_sr: int = 48000) -> Tuple[
         return None, None
 
 
+def get_video_fps(video_path: Path, fallback_fps: float = 30000 / 1001) -> float:
+    """Read FPS from video stream using PyAV, matching alignment extraction logic."""
+    try:
+        container = av.open(str(video_path))
+        video_stream = container.streams.video[0] if container.streams.video else None
+        if video_stream and video_stream.average_rate:
+            fps = float(video_stream.average_rate)
+            container.close()
+            return fps
+        container.close()
+    except Exception as e:
+        logger.warning(f"Could not read FPS from {video_path.name}: {e}")
+
+    return float(fallback_fps)
+
+
 def find_kaggle_audio_files() -> List[Path]:
     """Find video files (01*.mp4) from Kaggle dataset - extracts audio from videos only."""
     import os
@@ -990,6 +1044,18 @@ def main():
     if len(audio_files) == 0:
         logger.error("No audio files found! Please run download_kaggle_dataset.py first.")
         return
+
+    # Match alignment duration rule: segment duration = num_video_frames / fps_from_video.
+    aligned_fps = get_video_fps(audio_files[0], fallback_fps=audio_config.reference_video_fps)
+    audio_config.reference_video_fps = aligned_fps
+    audio_config.num_samples = int(round(audio_config.sample_rate * audio_config.num_video_frames / aligned_fps))
+    audio_config.stride = int(round(audio_config.num_samples * (1.0 - audio_config.overlap)))
+    audio_config.update_derived_params()
+    logger.info(
+        f"Aligned timing config from video FPS {aligned_fps:.5f}: "
+        f"duration={audio_config.chunk_duration_seconds:.6f}s, "
+        f"num_samples={audio_config.num_samples}, stride={audio_config.stride}"
+    )
     
     # Split dataset
     train_files, val_files, test_files = split_dataset(
