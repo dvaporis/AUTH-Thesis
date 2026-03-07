@@ -228,6 +228,40 @@ In order to ensure proper temporal alignment of the video and audio bites (lengt
 \end{figure}
 
 Obviously the correctness of the results cannot be proven with the provided figures, but they serve as an illustration of the subjective correctness the alignment of the files themselves display.
+
+\subsection{Contrastive Learning solely on audio files}
+
+In order to test the applicability of multimodal contrastive learning and whether the process converges or not, it was deemed necessary that single mode contrastive learning for both audio and muted video (see next section) be tested first. For this purpose, audio files that stem from the .mp4 files of the dataset are used as the training, validation and testing data with a proper split percentage. It is also ensured that the audio bites used exhibit an overlap percentage of around 50\% and that the length is approximately equal to the length of a 16 frame segment of the video.
+
+For the purposes of this study, a few methods of data augmentation for audio files were implemented. These include:
+
+\begin{itemize}
+\item Addition of white noise: equal power among all frequencies
+\item Addition of pink noise: power follows a $1/f$ distribution.
+\item Addition of brown noise: power follows a $1/f^2$ distribution.
+\item Addition of impulse noise: adds random but controlled spike noise.
+\item Time stretching while maintaining the same output length.
+\item Time squeezing with zero-padding to ensure same output length.
+\item Phase Shift in the frequency domain.
+\item Manifold Mixup: mixing two features in the embedding space as a linear combination where the linear combination parameter $\lambda$ follows a beta distribution. This ensures that the model learns to predict less confidently on interpolations of hidden represantations, creating smoother decision boundaries in cases of classification, or, in our case, allowing for interpolation of sounds. \cite{ManifoldMixup}
+\end{itemize}
+
+Since the encoding and decoding mechanism is very subtle and sensitive to change, the VAE remains frozen during this stage. Only a feature extraction head is trained, which maps the 1296-dimensions vector to a lower dimension (in which the contrastive learning objective is applied). The contrastive learning objective is similar to the one proposed earlier, consisting of a semantic contrast (do the 2 audio files originate from the same video, do they come from the same speaker, does the speaker showcase the same emotion...) and a temporal contrast (do the two audio files come from around the same time in the video, are the contents of the two files similar) component. 
+
+Initially, a test script was implemented to showcase that all of the above processes, including the data augmentation methods, are operational. These are some indicative results of the data augmentation processes:
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{test_augmentations.png}
+	\caption{Results of data augmentation methods}
+\end{figure}
+
+Out of the methods presented above, phase shift, time stretch and time squeeze are quite computationally expensive, so for an initial test they may be skipped. The contrastive learning script for audio files is ready, however the computational cost is quite high and therefore it was deemed necessary that the Institutional Cluster be used. This requires an additional period of learning and setup on my behalf, so progress has been a bit slower than expected.
+
+\subsection{Contrastive learning solely on video files}
+
+Currently under consideration. I will employ a method similar to the audio case. In this case, however, there is the extra freedom of being able to fine-tune the video encoder, since decoding from the video embedding is impossible in this current setup. In addition to training the feature extraction head, some layers of the Video Encoder may be unfrozen so as to improve training.
+
 \begin{thebibliography}{3}
 
 \bibitem{Diff-Foley}
@@ -265,5 +299,9 @@ A. Défossez, J. Copet, G. Synnaeve, Y. Adi,
 \bibitem{RAVDESS}
 S. R. Livingstone, F. A. Russo,
 ``The Ryerson Audio-Visual Database of Emotional Speech and Song (RAVDESS): A dynamic, multimodal set of facial and vocal expressions in North American English.''
+
+\bibitem{ManifoldMixup}
+V. Verma, A. Lamb, C. Beckham, A. Najafi, I. Mitliagkas, A. Courville, D. Lopez-Paz, Y. Bengio,
+``Manifold Mixup: Better Representations by Interpolating Hidden States''
 \end{thebibliography}
 \end{document}
