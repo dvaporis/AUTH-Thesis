@@ -51,6 +51,25 @@ def test_data_loading():
     
     dataset = AudioChunkDataset(train_files, audio_config, augment=False)
     logger.info(f"✓ Created dataset with {len(dataset)} chunks")
+    logger.info(f"✓ Configured overlap: {audio_config.overlap:.2f} (stride={audio_config.stride} samples)")
+
+    # Verify observed overlap from adjacent chunks of the same file.
+    observed_overlap = None
+    for i in range(1, len(dataset.chunks)):
+        prev_chunk = dataset.chunks[i - 1]
+        curr_chunk = dataset.chunks[i]
+        if prev_chunk['file_idx'] == curr_chunk['file_idx']:
+            observed_stride = curr_chunk['start_sample'] - prev_chunk['start_sample']
+            observed_overlap = 1.0 - (observed_stride / audio_config.num_samples)
+            break
+
+    if observed_overlap is not None:
+        logger.info(f"✓ Observed overlap from chunk index: {observed_overlap:.2%}")
+        if not (0.40 <= observed_overlap <= 0.60):
+            logger.error(f"❌ Observed overlap {observed_overlap:.2%} is outside expected ~50% range")
+            return False
+    else:
+        logger.warning("⚠ Could not measure overlap (not enough adjacent chunks from same file)")
     
     # Test loading a sample
     sample = dataset[0]

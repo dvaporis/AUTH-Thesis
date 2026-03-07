@@ -66,8 +66,13 @@ class AudioConfig:
     def __post_init__(self):
         if self.num_samples is None:
             self.num_samples = int(round(self.sample_rate * self.num_video_frames / self.reference_video_fps))
+
+        # Keep overlap-driven chunking valid and deterministic.
+        self.overlap = float(np.clip(self.overlap, 0.0, 0.99))
+
         if self.stride is None:
             self.stride = int(round(self.num_samples * (1.0 - self.overlap)))
+        self.stride = max(1, int(self.stride))
 
 
 @dataclass
@@ -330,19 +335,18 @@ class AudioChunkDataset(torch.utils.data.Dataset):
                     sr, audio_data = wavfile.read(str(audio_file))
                     audio_length = audio_data.shape[0] if audio_data.ndim > 1 else len(audio_data)
                 
-                # Calculate number of chunks with overlap
-                num_chunks = (audio_length - self.config.num_samples) // self.config.stride + 1
-                
-                if num_chunks < 1:
+                start_samples = self._compute_chunk_starts(audio_length)
+
+                if not start_samples:
                     continue
-                
+
                 # Add chunks to index
-                for chunk_idx in range(num_chunks):
-                    start_sample = chunk_idx * self.config.stride
+                for temporal_pos, start_sample in enumerate(start_samples):
                     self.chunks.append({
                         'file_idx': file_idx,
                         'file_path': audio_file,
                         'start_sample': start_sample,
+                        'temporal_pos': temporal_pos,
                         'sample_rate': sr,
                         'is_video': is_video,
                     })
@@ -352,6 +356,20 @@ class AudioChunkDataset(torch.utils.data.Dataset):
                 continue
         
         logger.info(f"Built index with {len(self.chunks)} chunks from {len(self.audio_files)} files")
+
+    def _compute_chunk_starts(self, audio_length: int) -> List[int]:
+        """Compute chunk start indices using overlap-defined stride (about 50% by default)."""
+        if audio_length < self.config.num_samples:
+            return []
+
+        max_start = audio_length - self.config.num_samples
+        starts = list(range(0, max_start + 1, self.config.stride))
+
+        # Ensure tail coverage even when length is not divisible by stride.
+        if starts and starts[-1] != max_start:
+            starts.append(max_start)
+
+        return starts
     
     def __len__(self):
         return len(self.chunks)
@@ -431,7 +449,7 @@ class AudioChunkDataset(torch.utils.data.Dataset):
                 audio_tensor = self.augmentation.augment(audio_tensor)
             
             # Return audio, file_idx (for semantic), and temporal position
-            temporal_pos = chunk_info['start_sample'] // self.config.stride
+            temporal_pos = chunk_info.get('temporal_pos', chunk_info['start_sample'] // self.config.stride)
             
             return {
                 'audio': audio_tensor,
