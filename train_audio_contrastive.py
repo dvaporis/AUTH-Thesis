@@ -96,6 +96,9 @@ class TrainingConfig:
     # Loss weights
     semantic_weight: float = 1.0
     temporal_weight: float = 0.5
+    temporal_window: int = 2  # Chunks within this distance in the same file are positives
+    acoustic_top_k: int = 2  # Extra cross-file positives per sample from acoustic neighbors
+    acoustic_sim_threshold: float = 0.30  # Minimum cosine similarity for acoustic positives
     
     # Data split
     train_ratio: float = 0.6
@@ -105,6 +108,10 @@ class TrainingConfig:
     # Classifier head
     projection_dim: int = 128
     hidden_dim: int = 512
+
+    # Convergence control
+    early_stopping_patience: int = 8
+    early_stopping_min_delta: float = 1e-3
 
 
 class AudioAugmentation:
@@ -640,58 +647,110 @@ class ContrastiveLoss(nn.Module):
     Temporal contrast: Different parts of the same video may have different/similar representations
     """
     
-    def __init__(self, temperature: float = 0.07, semantic_weight: float = 1.0, temporal_weight: float = 0.5):
+    def __init__(
+        self,
+        temperature: float = 0.07,
+        semantic_weight: float = 1.0,
+        temporal_weight: float = 0.5,
+        temporal_window: int = 2,
+        acoustic_top_k: int = 2,
+        acoustic_sim_threshold: float = 0.30,
+    ):
         super().__init__()
         self.temperature = temperature
         self.semantic_weight = semantic_weight
         self.temporal_weight = temporal_weight
-    
-    def info_nce_loss(self, features: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        self.temporal_window = temporal_window
+        self.acoustic_top_k = max(0, int(acoustic_top_k))
+        self.acoustic_sim_threshold = float(acoustic_sim_threshold)
+
+    def build_acoustic_positive_mask(
+        self,
+        encoder_embeddings: torch.Tensor,
+        file_indices: torch.Tensor,
+    ) -> torch.Tensor:
         """
-        InfoNCE loss for contrastive learning.
+        Build cross-file positives from acoustic nearest neighbors in frozen EnCodec space.
+
+        This encourages chunks with similar sound content (e.g., same phoneme by
+        different actors) to be considered positives for temporal learning.
+        """
+        batch_size = encoder_embeddings.shape[0]
+        device = encoder_embeddings.device
+        if batch_size <= 1 or self.acoustic_top_k <= 0:
+            return torch.zeros((batch_size, batch_size), dtype=torch.bool, device=device)
+
+        emb = F.normalize(encoder_embeddings.detach(), dim=1)
+        sim = torch.matmul(emb, emb.T)  # cosine since embeddings are normalized
+
+        eye = torch.eye(batch_size, dtype=torch.bool, device=device)
+        same_file = file_indices.unsqueeze(1) == file_indices.unsqueeze(0)
+
+        # Only mine cross-file neighbors; self-pairs are invalid.
+        candidate_mask = (~eye) & (~same_file)
+        sim_masked = sim.masked_fill(~candidate_mask, float('-inf'))
+
+        k = min(self.acoustic_top_k, max(1, batch_size - 1))
+        topk_vals, topk_idx = torch.topk(sim_masked, k=k, dim=1)
+
+        acoustic_mask = torch.zeros((batch_size, batch_size), dtype=torch.bool, device=device)
+        valid_topk = torch.isfinite(topk_vals) & (topk_vals >= self.acoustic_sim_threshold)
+
+        row_idx = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(topk_idx)
+        if valid_topk.any():
+            acoustic_mask[row_idx[valid_topk], topk_idx[valid_topk]] = True
+
+        # Symmetrize to stabilize pair assignment.
+        acoustic_mask = acoustic_mask | acoustic_mask.T
+        return acoustic_mask
+    
+    def info_nce_from_positive_mask(self, features: torch.Tensor, positive_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Multi-positive InfoNCE with explicit positive mask.
         
         Args:
             features: [batch, dim] - normalized features
-            labels: [batch] - labels for positive pairs
+            positive_mask: [batch, batch] bool mask where True indicates a positive pair
             
         Returns:
             loss: scalar
         """
         batch_size = features.shape[0]
-        
-        # Compute similarity matrix
-        similarity = torch.matmul(features, features.T) / self.temperature
-        
-        # Create masks for positive and negative pairs
-        labels = labels.unsqueeze(1)
-        mask_positive = (labels == labels.T).float()
-        mask_negative = (labels != labels.T).float()
-        
-        # Remove diagonal (self-similarity)
-        mask_positive = mask_positive - torch.eye(batch_size, device=features.device)
-        
-        # Compute loss
-        exp_sim = torch.exp(similarity)
-        
-        # For each sample, compute loss
-        losses = []
-        for i in range(batch_size):
-            # Positive samples
-            pos_sim = exp_sim[i] * mask_positive[i]
-            # Negative samples (all except positives and self)
-            neg_sim = exp_sim[i] * mask_negative[i]
-            
-            if pos_sim.sum() > 0:
-                # InfoNCE loss: -log(pos / (pos + neg))
-                loss_i = -torch.log(pos_sim.sum() / (pos_sim.sum() + neg_sim.sum() + 1e-8))
-                losses.append(loss_i)
-        
-        if len(losses) > 0:
-            return torch.stack(losses).mean()
-        else:
-            return torch.tensor(0.0, device=features.device)
+        device = features.device
+
+        if batch_size <= 1:
+            return torch.tensor(0.0, device=device)
+
+        # Remove self-pairs from both positives and denominator candidates.
+        eye = torch.eye(batch_size, dtype=torch.bool, device=device)
+        positive_mask = positive_mask.bool() & (~eye)
+        denominator_mask = ~eye
+
+        # Compute logits and apply masked log-softmax over non-self entries.
+        logits = torch.matmul(features, features.T) / self.temperature
+        logits = logits.masked_fill(~denominator_mask, float('-inf'))
+        log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
+
+        # Average log-prob over available positives per anchor.
+        positive_counts = positive_mask.sum(dim=1)
+        valid = positive_counts > 0
+
+        if not valid.any():
+            return torch.tensor(0.0, device=device)
+
+        # Avoid 0 * (-inf) -> NaN by masking with where instead of multiplication.
+        log_prob_pos = torch.where(positive_mask, log_prob, torch.zeros_like(log_prob))
+        mean_log_prob_pos = log_prob_pos.sum(dim=1) / positive_counts.clamp(min=1)
+        loss = -mean_log_prob_pos[valid].mean()
+        return loss
     
-    def forward(self, projections: torch.Tensor, file_indices: torch.Tensor, temporal_positions: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        projections: torch.Tensor,
+        file_indices: torch.Tensor,
+        temporal_positions: torch.Tensor,
+        encoder_embeddings: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
         """
         Compute contrastive loss with semantic and temporal components.
         
@@ -703,17 +762,20 @@ class ContrastiveLoss(nn.Module):
         Returns:
             Dictionary with total loss and component losses
         """
-        # Semantic loss: contrast different videos
-        semantic_loss = self.info_nce_loss(projections, file_indices)
-        
-        # Temporal loss: contrast different temporal positions
-        # Close temporal positions should be similar, far positions different
-        # We'll use a temporal proximity label
-        temporal_proximity = torch.abs(temporal_positions.unsqueeze(1) - temporal_positions.unsqueeze(0))
-        temporal_labels = (temporal_proximity <= 2).long()  # Adjacent chunks are positive
-        temporal_labels = temporal_labels.argmax(dim=1)  # Convert to label format
-        
-        temporal_loss = self.info_nce_loss(projections, temporal_labels)
+        same_file = file_indices.unsqueeze(1) == file_indices.unsqueeze(0)
+        temporal_distance = torch.abs(temporal_positions.unsqueeze(1) - temporal_positions.unsqueeze(0))
+
+        # Semantic positives: chunks from the same file/video.
+        semantic_positive_mask = same_file
+        semantic_loss = self.info_nce_from_positive_mask(projections, semantic_positive_mask)
+
+        # Temporal positives: nearby chunks in same file OR acoustically similar chunks across files.
+        temporal_positive_mask = same_file & (temporal_distance <= self.temporal_window)
+        if encoder_embeddings is not None:
+            acoustic_positive_mask = self.build_acoustic_positive_mask(encoder_embeddings, file_indices)
+            temporal_positive_mask = temporal_positive_mask | acoustic_positive_mask
+
+        temporal_loss = self.info_nce_from_positive_mask(projections, temporal_positive_mask)
         
         # Total loss
         total_loss = self.semantic_weight * semantic_loss + self.temporal_weight * temporal_loss
@@ -894,15 +956,21 @@ def train_epoch(model: AudioContrastiveModel, dataloader: torch.utils.data.DataL
         temporal_pos = batch['temporal_pos'].to(device)
         
         # Forward pass
-        projections = model(audio)
+        encoder_embeddings = model.encode(audio)
+        projections = model.projection_head(encoder_embeddings)
         
         # Apply manifold mixup with some probability
         if apply_manifold_mixup and random.random() < 0.3:
             projections, file_idx, lam = augmentation.manifold_mixup(projections, file_idx)
         
         # Compute loss
-        loss_dict = criterion(projections, file_idx, temporal_pos)
+        loss_dict = criterion(projections, file_idx, temporal_pos, encoder_embeddings=encoder_embeddings)
         loss = loss_dict['total_loss']
+
+        # Skip numerically invalid batches to keep optimizer state healthy.
+        if not torch.isfinite(loss):
+            logger.warning("Skipping batch with non-finite training loss")
+            continue
         
         # Backward pass
         optimizer.zero_grad()
@@ -922,6 +990,13 @@ def train_epoch(model: AudioContrastiveModel, dataloader: torch.utils.data.DataL
             'temporal': total_temporal / num_batches,
         })
     
+    if num_batches == 0:
+        return {
+            'loss': float('inf'),
+            'semantic_loss': float('inf'),
+            'temporal_loss': float('inf'),
+        }
+
     return {
         'loss': total_loss / num_batches,
         'semantic_loss': total_semantic / num_batches,
@@ -946,10 +1021,15 @@ def validate(model: AudioContrastiveModel, dataloader: torch.utils.data.DataLoad
         temporal_pos = batch['temporal_pos'].to(device)
         
         # Forward pass
-        projections = model(audio)
+        encoder_embeddings = model.encode(audio)
+        projections = model.projection_head(encoder_embeddings)
         
         # Compute loss
-        loss_dict = criterion(projections, file_idx, temporal_pos)
+        loss_dict = criterion(projections, file_idx, temporal_pos, encoder_embeddings=encoder_embeddings)
+
+        if not torch.isfinite(loss_dict['total_loss']):
+            logger.warning("Skipping batch with non-finite validation loss")
+            continue
         
         # Accumulate metrics
         total_loss += loss_dict['total_loss'].item()
@@ -957,6 +1037,13 @@ def validate(model: AudioContrastiveModel, dataloader: torch.utils.data.DataLoad
         total_temporal += loss_dict['temporal_loss'].item()
         num_batches += 1
     
+    if num_batches == 0:
+        return {
+            'loss': float('inf'),
+            'semantic_loss': float('inf'),
+            'temporal_loss': float('inf'),
+        }
+
     return {
         'loss': total_loss / num_batches,
         'semantic_loss': total_semantic / num_batches,
@@ -1008,6 +1095,16 @@ def main():
     parser.add_argument('--batch-size', type=int, default=32, help='Batch size')
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
     parser.add_argument('--temperature', type=float, default=0.07, help='Contrastive loss temperature')
+    parser.add_argument('--temporal-window', type=int, default=2,
+                        help='Max chunk distance for temporal positive pairs (same file only)')
+    parser.add_argument('--acoustic-top-k', type=int, default=2,
+                        help='Number of cross-file acoustic neighbors used as temporal positives')
+    parser.add_argument('--acoustic-sim-threshold', type=float, default=0.30,
+                        help='Minimum cosine similarity for acoustic temporal positives')
+    parser.add_argument('--early-stopping-patience', type=int, default=8,
+                        help='Stop after this many epochs without meaningful val improvement')
+    parser.add_argument('--early-stopping-min-delta', type=float, default=1e-3,
+                        help='Minimum val loss improvement to reset early-stopping counter')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--output-dir', type=str, default='audio_contrastive_results', help='Output directory')
     parser.add_argument('--no-augmentation', action='store_true', help='Disable data augmentation')
@@ -1035,6 +1132,11 @@ def main():
         num_epochs=args.epochs,
         learning_rate=args.lr,
         temperature=args.temperature,
+        temporal_window=args.temporal_window,
+        acoustic_top_k=args.acoustic_top_k,
+        acoustic_sim_threshold=args.acoustic_sim_threshold,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
     )
     
     # Find audio files
@@ -1126,7 +1228,10 @@ def main():
     criterion = ContrastiveLoss(
         temperature=training_config.temperature,
         semantic_weight=training_config.semantic_weight,
-        temporal_weight=training_config.temporal_weight
+        temporal_weight=training_config.temporal_weight,
+        temporal_window=training_config.temporal_window,
+        acoustic_top_k=training_config.acoustic_top_k,
+        acoustic_sim_threshold=training_config.acoustic_sim_threshold,
     )
     
     optimizer = torch.optim.Adam(
@@ -1135,9 +1240,12 @@ def main():
         weight_decay=training_config.weight_decay
     )
     
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        T_max=training_config.num_epochs
+        mode='min',
+        factor=0.5,
+        patience=2,
+        min_lr=1e-6,
     )
     
     # Training history
@@ -1151,6 +1259,7 @@ def main():
     }
     
     best_val_loss = float('inf')
+    epochs_without_improvement = 0
     
     # Training loop
     logger.info("Starting training...")
@@ -1165,8 +1274,8 @@ def main():
         # Validate
         val_metrics = validate(model, val_loader, criterion, device)
         
-        # Update scheduler
-        scheduler.step()
+        # Update scheduler based on validation loss
+        scheduler.step(val_metrics['loss'])
         
         # Log metrics
         logger.info(f"Train - Loss: {train_metrics['loss']:.4f}, "
@@ -1185,8 +1294,9 @@ def main():
         history['val_temporal'].append(val_metrics['temporal_loss'])
         
         # Save best model
-        if val_metrics['loss'] < best_val_loss:
+        if val_metrics['loss'] < (best_val_loss - training_config.early_stopping_min_delta):
             best_val_loss = val_metrics['loss']
+            epochs_without_improvement = 0
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -1195,6 +1305,14 @@ def main():
                 'config': training_config,
             }, output_dir / 'best_model.pt')
             logger.info(f"✓ Saved best model (val_loss: {best_val_loss:.4f})")
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= training_config.early_stopping_patience:
+                logger.info(
+                    f"Early stopping triggered after {epoch + 1} epochs "
+                    f"(best val_loss: {best_val_loss:.4f})"
+                )
+                break
     
     # Test on best model
     logger.info("\nEvaluating on test set...")
