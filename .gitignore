@@ -2,6 +2,7 @@
 kaggle_datasets/
 .cache/
 **/.cache/
+ravdess_videos_only
 
 # Results and outputs
 audio_encodec_results/
