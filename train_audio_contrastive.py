@@ -1302,7 +1302,7 @@ def main():
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': val_metrics['loss'],
-                'config': training_config,
+                'config': training_config.__dict__,
             }, output_dir / 'best_model.pt')
             logger.info(f"✓ Saved best model (val_loss: {best_val_loss:.4f})")
         else:
@@ -1316,7 +1316,7 @@ def main():
     
     # Test on best model
     logger.info("\nEvaluating on test set...")
-    checkpoint = torch.load(output_dir / 'best_model.pt')
+    checkpoint = torch.load(output_dir / 'best_model.pt', weights_only=False, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     test_metrics = validate(model, test_loader, criterion, device)
     logger.info(f"Test - Loss: {test_metrics['loss']:.4f}, "
@@ -1338,7 +1338,7 @@ def main():
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'history': history,
-        'config': training_config,
+        'config': training_config.__dict__,
     }, output_dir / 'final_model.pt')
     
     logger.info(f"\n✓ Training complete! Results saved to {output_dir}")
