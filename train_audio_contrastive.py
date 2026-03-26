@@ -706,7 +706,7 @@ class ContrastiveLoss(nn.Module):
     
     def info_nce_from_positive_mask(self, features: torch.Tensor, positive_mask: torch.Tensor) -> torch.Tensor:
         """
-        Multi-positive InfoNCE with explicit positive mask.
+        Multi-positive InfoNCE with explicit positive mask (Diff-Foley compatible).
         
         Args:
             features: [batch, dim] - normalized features
@@ -744,20 +744,52 @@ class ContrastiveLoss(nn.Module):
         loss = -mean_log_prob_pos[valid].mean()
         return loss
     
+    def compute_augmentation_positives(self, features: torch.Tensor) -> torch.Tensor:
+        """
+        Compute augmentation-based positives for improved training stability.
+        Assumes features are organized as [v1_0, v1_1, ..., v2_0, v2_1, ...]
+        where v1_i and v2_i are augmented views of the same chunk i.
+        
+        Args:
+            features: [2*batch, dim] - concatenated v1 and v2 projections
+            
+        Returns:
+            loss: scalar
+        """
+        batch_size = features.shape[0] // 2
+        device = features.device
+        
+        if batch_size <= 0:
+            return torch.tensor(0.0, device=device)
+        
+        # Create positive mask: each v1_i is positive with v2_i
+        positive_mask = torch.eye(batch_size, dtype=torch.bool, device=device)
+        positive_mask = torch.block_diag(positive_mask, positive_mask)  # Block diagonal structure
+        # Swap blocks: make (i, batch+i) and (batch+i, i) true
+        for i in range(batch_size):
+            positive_mask[i, batch_size + i] = True
+            positive_mask[batch_size + i, i] = True
+        
+        return self.info_nce_from_positive_mask(features, positive_mask)
+    
     def forward(
         self,
         projections: torch.Tensor,
         file_indices: torch.Tensor,
         temporal_positions: torch.Tensor,
         encoder_embeddings: Optional[torch.Tensor] = None,
+        augmentation_loss_weight: float = 0.2,
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute contrastive loss with semantic and temporal components.
+        Compute Diff-Foley compatible contrastive loss with semantic and temporal components.
+        Also includes augmentation-based positives for improved training stability.
         
         Args:
             projections: [batch, projection_dim] - normalized projections
             file_indices: [batch] - file/video identifiers
             temporal_positions: [batch] - temporal positions within videos
+            encoder_embeddings: Optional encoder embeddings for acoustic similarity
+            augmentation_loss_weight: Weight for augmentation-based positive pairs loss
             
         Returns:
             Dictionary with total loss and component losses
@@ -765,11 +797,11 @@ class ContrastiveLoss(nn.Module):
         same_file = file_indices.unsqueeze(1) == file_indices.unsqueeze(0)
         temporal_distance = torch.abs(temporal_positions.unsqueeze(1) - temporal_positions.unsqueeze(0))
 
-        # Semantic positives: chunks from the same file/video.
+        # Semantic positives: chunks from the same file/video (Diff-Foley style).
         semantic_positive_mask = same_file
         semantic_loss = self.info_nce_from_positive_mask(projections, semantic_positive_mask)
 
-        # Temporal positives: nearby chunks in same file OR acoustically similar chunks across files.
+        # Temporal positives: nearby chunks in same file OR acoustically similar chunks across files (Diff-Foley style).
         temporal_positive_mask = same_file & (temporal_distance <= self.temporal_window)
         if encoder_embeddings is not None:
             acoustic_positive_mask = self.build_acoustic_positive_mask(encoder_embeddings, file_indices)
@@ -777,13 +809,21 @@ class ContrastiveLoss(nn.Module):
 
         temporal_loss = self.info_nce_from_positive_mask(projections, temporal_positive_mask)
         
-        # Total loss
-        total_loss = self.semantic_weight * semantic_loss + self.temporal_weight * temporal_loss
+        # Augmentation-based positives: improve training stability
+        # Only compute if batch is doubled (from two augmented views)
+        augmentation_loss = torch.tensor(0.0, device=projections.device)
+        if projections.shape[0] > 1 and projections.shape[0] % 2 == 0:
+            augmentation_loss = self.compute_augmentation_positives(projections)
+        
+        # Total loss: Diff-Foley base + augmentation regularization
+        base_loss = self.semantic_weight * semantic_loss + self.temporal_weight * temporal_loss
+        total_loss = base_loss + augmentation_loss_weight * augmentation_loss
         
         return {
             'total_loss': total_loss,
             'semantic_loss': semantic_loss,
             'temporal_loss': temporal_loss,
+            'augmentation_loss': augmentation_loss,
         }
 
 
@@ -946,6 +986,7 @@ def train_epoch(model: AudioContrastiveModel, dataloader: torch.utils.data.DataL
     total_loss = 0.0
     total_semantic = 0.0
     total_temporal = 0.0
+    total_augmentation = 0.0
     num_batches = 0
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{total_epochs}", unit="batch", leave=True)
@@ -955,16 +996,34 @@ def train_epoch(model: AudioContrastiveModel, dataloader: torch.utils.data.DataL
         file_idx = batch['file_idx'].to(device)
         temporal_pos = batch['temporal_pos'].to(device)
         
-        # Forward pass
-        encoder_embeddings = model.encode(audio)
-        projections = model.projection_head(encoder_embeddings)
+        # Create two augmented views of the audio for augmentation-based positive pairs
+        audio_v1 = augmentation.augment(audio)
+        audio_v2 = augmentation.augment(audio)
+        
+        # Forward pass for both views
+        encoder_embeddings_v1 = model.encode(audio_v1)
+        projections_v1 = model.projection_head(encoder_embeddings_v1)
+        
+        encoder_embeddings_v2 = model.encode(audio_v2)
+        projections_v2 = model.projection_head(encoder_embeddings_v2)
+        
+        # Concatenate projections: [batch_v1, batch_v2]
+        # This allows loss to compute: (1) Diff-Foley semantic/temporal, (2) augmentation-based positives
+        projections = torch.cat([projections_v1, projections_v2], dim=0)
+        file_idx_doubled = torch.cat([file_idx, file_idx], dim=0)
+        temporal_pos_doubled = torch.cat([temporal_pos, temporal_pos], dim=0)
+        encoder_embeddings_doubled = torch.cat([encoder_embeddings_v1, encoder_embeddings_v2], dim=0)
         
         # Apply manifold mixup with some probability
         if apply_manifold_mixup and random.random() < 0.3:
-            projections, file_idx, lam = augmentation.manifold_mixup(projections, file_idx)
+            projections, file_idx_doubled, lam = augmentation.manifold_mixup(projections, file_idx_doubled)
         
-        # Compute loss
-        loss_dict = criterion(projections, file_idx, temporal_pos, encoder_embeddings=encoder_embeddings)
+        # Compute loss: Diff-Foley style + augmentation regularization
+        loss_dict = criterion(
+            projections, file_idx_doubled, temporal_pos_doubled, 
+            encoder_embeddings=encoder_embeddings_doubled,
+            augmentation_loss_weight=0.2
+        )
         loss = loss_dict['total_loss']
 
         # Skip numerically invalid batches to keep optimizer state healthy.
@@ -981,6 +1040,7 @@ def train_epoch(model: AudioContrastiveModel, dataloader: torch.utils.data.DataL
         total_loss += loss.item()
         total_semantic += loss_dict['semantic_loss'].item()
         total_temporal += loss_dict['temporal_loss'].item()
+        total_augmentation += loss_dict.get('augmentation_loss', torch.tensor(0.0)).item()
         num_batches += 1
         
         # Update progress bar
@@ -988,6 +1048,7 @@ def train_epoch(model: AudioContrastiveModel, dataloader: torch.utils.data.DataL
             'loss': total_loss / num_batches,
             'semantic': total_semantic / num_batches,
             'temporal': total_temporal / num_batches,
+            'aug': total_augmentation / num_batches,
         })
     
     if num_batches == 0:
@@ -995,12 +1056,14 @@ def train_epoch(model: AudioContrastiveModel, dataloader: torch.utils.data.DataL
             'loss': float('inf'),
             'semantic_loss': float('inf'),
             'temporal_loss': float('inf'),
+            'augmentation_loss': 0.0,
         }
 
     return {
         'loss': total_loss / num_batches,
         'semantic_loss': total_semantic / num_batches,
         'temporal_loss': total_temporal / num_batches,
+        'augmentation_loss': total_augmentation / num_batches,
     }
 
 
