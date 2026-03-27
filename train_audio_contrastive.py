@@ -59,6 +59,9 @@ class AudioConfig:
     noise_level_db: float = 20.0  # SNR for additive noise (signal 100x stronger than noise)
     impulse_prob: float = 0.1
     impulse_amplitude: float = 0.5  # Max amplitude for impulse noise
+    time_mask_prob: float = 0.5  # Probability of applying time masking
+    time_mask_max_ratio: float = 0.12  # Max masked span as fraction of chunk length
+    time_mask_num_masks: Tuple[int, int] = (1, 3)  # Random number of masks to apply
     stretch_range: Tuple[float, float] = (0.9, 1.1)  # Time stretching range
     phase_shift_range: Tuple[float, float] = (-np.pi, np.pi)
     mixup_alpha: float = 0.3  # For manifold mixup
@@ -91,7 +94,7 @@ class TrainingConfig:
     num_epochs: int = 50
     learning_rate: float = 0.001
     weight_decay: float = 1e-4
-    temperature: float = 0.07  # Contrastive loss temperature
+    temperature: float = 0.1  # Softer contrastive temperature for better generalization
     
     # Loss weights
     semantic_weight: float = 1.0
@@ -194,6 +197,61 @@ class AudioAugmentation:
         mask = torch.rand_like(audio) < prob
         impulses = torch.randn_like(audio) * self.config.impulse_amplitude  # Controlled amplitude
         return audio + mask.float() * impulses
+
+    def apply_time_masking(
+        self,
+        audio: torch.Tensor,
+        max_mask_ratio: float = None,
+        num_masks: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        SpecAugment-style time masking on raw waveform.
+
+        Supports both [C, T] and [B, C, T] tensors by zeroing random temporal spans.
+        """
+        if random.random() >= self.config.time_mask_prob:
+            return audio
+
+        if max_mask_ratio is None:
+            max_mask_ratio = self.config.time_mask_max_ratio
+
+        max_mask_ratio = float(np.clip(max_mask_ratio, 0.0, 0.9))
+        if max_mask_ratio <= 0.0:
+            return audio
+
+        if audio.dim() == 2:
+            audio_work = audio.unsqueeze(0)
+            squeeze_back = True
+        elif audio.dim() == 3:
+            audio_work = audio
+            squeeze_back = False
+        else:
+            return audio
+
+        bsz, _, t = audio_work.shape
+        if t <= 1:
+            return audio
+
+        min_masks, max_masks = self.config.time_mask_num_masks
+        if num_masks is None:
+            num_masks = random.randint(min_masks, max_masks)
+
+        max_mask_len = max(1, int(round(t * max_mask_ratio)))
+        masked = audio_work.clone()
+        for b in range(bsz):
+            for _ in range(max(1, num_masks)):
+                mask_len = random.randint(1, max_mask_len)
+                if mask_len >= t:
+                    start = 0
+                    end = t
+                else:
+                    start = random.randint(0, t - mask_len)
+                    end = start + mask_len
+                masked[b, :, start:end] = 0.0
+
+        if squeeze_back:
+            return masked.squeeze(0)
+        return masked
     
     def time_stretch(self, audio: torch.Tensor, rate: float = None) -> torch.Tensor:
         """
@@ -325,6 +383,7 @@ class AudioAugmentation:
             audio = self.add_white_noise(audio)
             audio = self.add_colored_noise(audio, color=random.choice(['pink', 'brown']))
             audio = self.add_impulse_noise(audio)
+            audio = self.apply_time_masking(audio)
         else:
             # Randomly select FAST augmentations only
             # Time stretching and phase shift are too slow for training
@@ -333,6 +392,7 @@ class AudioAugmentation:
                 lambda x: self.add_colored_noise(x, color='pink'),
                 lambda x: self.add_colored_noise(x, color='brown'),
                 lambda x: self.add_impulse_noise(x),
+                lambda x: self.apply_time_masking(x),
             ]
             
             # Apply 0-2 random augmentations (sparse augmentation)
@@ -530,13 +590,9 @@ class ProjectionHead(nn.Module):
         
         self.projection = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.1),
+            nn.Dropout(0.3),
             nn.Linear(hidden_dim, output_dim),
         )
     
@@ -1182,7 +1238,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
     parser.add_argument('--batch-size', type=int, default=32, help='Batch size')
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
-    parser.add_argument('--temperature', type=float, default=0.07, help='Contrastive loss temperature')
+    parser.add_argument('--temperature', type=float, default=0.1, help='Contrastive loss temperature')
     parser.add_argument('--temporal-window', type=int, default=2,
                         help='Max chunk distance for temporal positive pairs (same file only)')
     parser.add_argument('--acoustic-top-k', type=int, default=2,
