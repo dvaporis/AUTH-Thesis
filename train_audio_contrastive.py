@@ -141,7 +141,7 @@ class AudioAugmentation:
         if snr_db is None:
             snr_db = self.config.noise_level_db
         
-        # Generate white noise
+        # Generate white noise (supports [C, T] or [B, C, T])
         white_noise = torch.randn_like(audio)
         
         # Apply coloring filter in frequency domain
@@ -156,16 +156,24 @@ class AudioAugmentation:
         
         kernel = kernel.to(audio.device)
         
-        # Apply filter
+        # Apply filter along the time axis.
+        # conv1d expects [N, C_in, L], so we flatten non-time dims to a batch axis.
         if len(kernel) > 1:
+            original_shape = white_noise.shape
+            white_noise_reshaped = white_noise.reshape(-1, 1, original_shape[-1])
             colored_noise = F.conv1d(
-                white_noise.unsqueeze(1), 
+                white_noise_reshaped,
                 kernel.view(1, 1, -1),
-                padding=len(kernel)//2
-            ).squeeze(1)
-            # Ensure same length as original
-            if colored_noise.shape[-1] != audio.shape[-1]:
+                padding=len(kernel) // 2,
+            )
+            colored_noise = colored_noise.reshape(*original_shape[:-1], colored_noise.shape[-1])
+
+            # Ensure same temporal length as original
+            if colored_noise.shape[-1] > audio.shape[-1]:
                 colored_noise = colored_noise[..., :audio.shape[-1]]
+            elif colored_noise.shape[-1] < audio.shape[-1]:
+                pad_len = audio.shape[-1] - colored_noise.shape[-1]
+                colored_noise = F.pad(colored_noise, (0, pad_len))
         else:
             colored_noise = white_noise
         
@@ -779,6 +787,7 @@ class ContrastiveLoss(nn.Module):
         temporal_positions: torch.Tensor,
         encoder_embeddings: Optional[torch.Tensor] = None,
         augmentation_loss_weight: float = 0.2,
+        use_augmentation_pairs: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """
         Compute Diff-Foley compatible contrastive loss with semantic and temporal components.
@@ -790,6 +799,8 @@ class ContrastiveLoss(nn.Module):
             temporal_positions: [batch] - temporal positions within videos
             encoder_embeddings: Optional encoder embeddings for acoustic similarity
             augmentation_loss_weight: Weight for augmentation-based positive pairs loss
+            use_augmentation_pairs: True only when projections are organized as concatenated
+                augmented views [v1_batch, v2_batch] with aligned indices
             
         Returns:
             Dictionary with total loss and component losses
@@ -810,9 +821,9 @@ class ContrastiveLoss(nn.Module):
         temporal_loss = self.info_nce_from_positive_mask(projections, temporal_positive_mask)
         
         # Augmentation-based positives: improve training stability
-        # Only compute if batch is doubled (from two augmented views)
+        # Compute only when caller explicitly provides paired augmented views.
         augmentation_loss = torch.tensor(0.0, device=projections.device)
-        if projections.shape[0] > 1 and projections.shape[0] % 2 == 0:
+        if use_augmentation_pairs and projections.shape[0] > 1 and projections.shape[0] % 2 == 0:
             augmentation_loss = self.compute_augmentation_positives(projections)
         
         # Total loss: Diff-Foley base + augmentation regularization
@@ -1022,7 +1033,8 @@ def train_epoch(model: AudioContrastiveModel, dataloader: torch.utils.data.DataL
         loss_dict = criterion(
             projections, file_idx_doubled, temporal_pos_doubled, 
             encoder_embeddings=encoder_embeddings_doubled,
-            augmentation_loss_weight=0.2
+            augmentation_loss_weight=0.2,
+            use_augmentation_pairs=True,
         )
         loss = loss_dict['total_loss']
 
@@ -1076,6 +1088,7 @@ def validate(model: AudioContrastiveModel, dataloader: torch.utils.data.DataLoad
     total_loss = 0.0
     total_semantic = 0.0
     total_temporal = 0.0
+    total_augmentation = 0.0
     num_batches = 0
     
     for batch in dataloader:
@@ -1098,6 +1111,7 @@ def validate(model: AudioContrastiveModel, dataloader: torch.utils.data.DataLoad
         total_loss += loss_dict['total_loss'].item()
         total_semantic += loss_dict['semantic_loss'].item()
         total_temporal += loss_dict['temporal_loss'].item()
+        total_augmentation += loss_dict.get('augmentation_loss', torch.tensor(0.0)).item()
         num_batches += 1
     
     if num_batches == 0:
@@ -1105,18 +1119,20 @@ def validate(model: AudioContrastiveModel, dataloader: torch.utils.data.DataLoad
             'loss': float('inf'),
             'semantic_loss': float('inf'),
             'temporal_loss': float('inf'),
+            'augmentation_loss': 0.0,
         }
 
     return {
         'loss': total_loss / num_batches,
         'semantic_loss': total_semantic / num_batches,
         'temporal_loss': total_temporal / num_batches,
+        'augmentation_loss': total_augmentation / num_batches,
     }
 
 
 def plot_training_history(history: Dict[str, List[float]], save_path: str):
     """Plot and save training history."""
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
     
     epochs = range(1, len(history['train_loss']) + 1)
     
@@ -1146,6 +1162,15 @@ def plot_training_history(history: Dict[str, List[float]], save_path: str):
     axes[2].set_title('Temporal Loss')
     axes[2].legend()
     axes[2].grid(True)
+
+    # Augmentation-pair loss
+    axes[3].plot(epochs, history['train_augmentation'], 'b-', label='Train')
+    axes[3].plot(epochs, history['val_augmentation'], 'r-', label='Val')
+    axes[3].set_xlabel('Epoch')
+    axes[3].set_ylabel('Loss')
+    axes[3].set_title('Augmentation-Pair Loss')
+    axes[3].legend()
+    axes[3].grid(True)
     
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -1316,9 +1341,11 @@ def main():
         'train_loss': [],
         'train_semantic': [],
         'train_temporal': [],
+        'train_augmentation': [],
         'val_loss': [],
         'val_semantic': [],
         'val_temporal': [],
+        'val_augmentation': [],
     }
     
     best_val_loss = float('inf')
@@ -1352,9 +1379,11 @@ def main():
         history['train_loss'].append(train_metrics['loss'])
         history['train_semantic'].append(train_metrics['semantic_loss'])
         history['train_temporal'].append(train_metrics['temporal_loss'])
+        history['train_augmentation'].append(train_metrics['augmentation_loss'])
         history['val_loss'].append(val_metrics['loss'])
         history['val_semantic'].append(val_metrics['semantic_loss'])
         history['val_temporal'].append(val_metrics['temporal_loss'])
+        history['val_augmentation'].append(val_metrics.get('augmentation_loss', 0.0))
         
         # Save best model
         if val_metrics['loss'] < (best_val_loss - training_config.early_stopping_min_delta):
