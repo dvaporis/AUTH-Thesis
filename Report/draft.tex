@@ -262,6 +262,39 @@ Out of the methods presented above, phase shift, time stretch and time squeeze a
 
 Currently under consideration. I will employ a method similar to the audio case. In this case, however, there is the extra freedom of being able to fine-tune the video encoder, since decoding from the video embedding is impossible in this current setup. In addition to training the feature extraction head, some layers of the Video Encoder may be unfrozen so as to improve training.
 
+\section{Original Time Domain and MFCCs}
+
+Following the disappointing results of the training of the previous method, two different approaches were tested for the Contrastive Learning method of speech segments. A method similar to SimCLR \cite{SimCLR} was applied for inputs being samples both in the Original Time Domain as well as MFCCs (Mel-frequency cepstral coefficients). 
+
+\subsection{Original Time Domain signals}
+
+Initially, original time domain signals were used as samples for the contrastive learning objective. Using non-overlapping speech segments with length 0.5s, a ``speech chunk index'' was built and enhanced with the results of various methods of data augmentation to these speech segments: white, pink and brown noise, phase shift as well as time stretch. Each speech segment was augmented exactly once with one of the previous techniques. 
+
+The model trained included 4 1-dimensional convolutional layers with batch normalization, a ReLU activation function and pooling (max pooling for the first 3 layers and average pooling for the last layer). The resulting dimension after the convolutional layers was 512. The projection head included a linear layer with batch normalization, a ReLU activation function and dropout, leading to a hidden dimension of 512. Lastly, another linear layer led to the final 128-dimensional space.
+
+The model was trained with the NT-Xent loss (the same one used in SimCLR \cite{SimCLR}), an Adam optimizer and a learning rate scheduler to ensure smoother convergence. Positive pairs only included the pairs corresponding to the original time domain sample and the result of its augmentation. These are the results of the training:
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{training_history_OTD.png}
+	\caption{Results of training in the original time domain}
+\end{figure}
+
+The results indicate learning but inability to properly adapt to the validation set, since the validation curve seems to plateau quite early. Training is also not smooth since there is a spike in the validation loss during epoch 8.
+
+\subsection{Mel-frequency cepstral coefficients}
+
+As a follow-up to the previous method, the use of MFCCs was also tested, since they are widely used in speech recognition systems. Each speech segment is resampled using a frequency of 16kHz, resulting in 8000 samples for each audio chunk. Following the calculation of the MFCCs, these 8000 samples result in 13 MFCCs for each of 48 time frames, meaning the output is a tensor with shape [13,48]. 
+
+Since the results of MFCC application are 2-dimensional, it is highly efficient to use the ResNet pre-trained model and finetune it, since it has been shown to learn various important patterns in 2-dimensional space. The same data augmentations techniques were used as in the previous approach. The projection head was also the same. ResNet-18 was chosen as the ResNet model to be used, with a minor tweak needed in the first convolutional layer of the model to accept 1-channel inputs. All other aspects of training were kept the same to enable a comparison between the methods. These are the results:
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{training_history_MFCC.png}
+	\caption{Results of training in the original time domain}
+\end{figure}
+
+Overall, much better values of the loss function were achieved for both the training and the validation sets, while the convergence was also a lot smoother. After around 35 epochs, validation loss hit a plateau at values of around 0.9.
 \begin{thebibliography}{3}
 
 \bibitem{Diff-Foley}
@@ -303,5 +336,17 @@ S. R. Livingstone, F. A. Russo,
 \bibitem{ManifoldMixup}
 V. Verma, A. Lamb, C. Beckham, A. Najafi, I. Mitliagkas, A. Courville, D. Lopez-Paz, Y. Bengio,
 ``Manifold Mixup: Better Representations by Interpolating Hidden States''
+
+\bibitem{SpeechSimCLR}
+D. Jiang, W. Li, M. Cao, W. Zou, X. Li,
+``Speech SimCLR: Combining Contrastive and Reconstruction Objective forSelf-supervised Speech Representation Learning''
+
+\bibitem{SimCLR}
+T. Chen, S. Kornblith, M. Norouzi, G. Hinton ,
+``A Simple Framework for Contrastive Learning of Visual Representations''
+
+\bibitem{wav2vec2.0}
+A. Baevski, H. Zhou, A. Mohamed, M. Auli,
+``wav2vec 2.0: A Framework for Self-Supervised Learning of Speech Representations''
 \end{thebibliography}
 \end{document}
