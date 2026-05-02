@@ -11,6 +11,8 @@ videomae_results/
 av_hubert_results/
 aligned_results/
 audio_contrastive_results/
+mfcc_contrastive_results/
+time_domain_contrastive_results/
 
 # Python environment
 .venv/
