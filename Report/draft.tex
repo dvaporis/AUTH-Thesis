@@ -258,10 +258,6 @@ Initially, a test script was implemented to showcase that all of the above proce
 
 Out of the methods presented above, phase shift, time stretch and time squeeze are quite computationally expensive, so for an initial test they may be skipped. The contrastive learning script for audio files is ready, however the computational cost is quite high and therefore it was deemed necessary that the Institutional Cluster be used. This requires an additional period of learning and setup on my behalf, so progress has been a bit slower than expected.
 
-\subsection{Contrastive learning solely on video files}
-
-Currently under consideration. I will employ a method similar to the audio case. In this case, however, there is the extra freedom of being able to fine-tune the video encoder, since decoding from the video embedding is impossible in this current setup. In addition to training the feature extraction head, some layers of the Video Encoder may be unfrozen so as to improve training.
-
 \section{Original Time Domain and MFCCs}
 
 Following the disappointing results of the training of the previous method, two different approaches were tested for the Contrastive Learning method of speech segments. A method similar to SimCLR \cite{SimCLR} was applied for inputs being samples both in the Original Time Domain as well as MFCCs (Mel-frequency cepstral coefficients). 
@@ -295,8 +291,53 @@ Since the results of MFCC application are 2-dimensional, it is highly efficient 
 \end{figure}
 
 Overall, much better values of the loss function were achieved for both the training and the validation sets, while the convergence was also a lot smoother. After around 35 epochs, validation loss hit a plateau at values of around 0.9.
-\begin{thebibliography}{3}
 
+\section{Video Contrastive Learning}
+
+After testing the contrastive learning setup for the audio files, testing the contrastive learning method solely on video files was the next step. For that purpose, the video memory sizes were shrinked by focusing on the area of the lips and various data augmentation methods were tested.
+
+\subsection{Lip Recognition}
+
+Since videos were originally in 720p resolution (1280 x 720 pixels), training was deemed too computationally expensive to carry out without shrinking the memory necessity. This task was carried out by a system of lip recognition, which focused each video chunk to the area of the speaker's lips.
+
+The model used for this section was Google's MediaPipe Face Mesh, which is a face geometry solution capable of estimating 468 3D face landmarks in real time. The area around the speaker's lips was bounded successfully and resized to a standard default option of 224 x 224 pixels. A couple of examples are shown below.
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{LipRecognition1.jpg}
+	\caption{First example of lip recognition}
+\end{figure}
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{LipRecognition2.jpg}
+	\caption{Second example of lip recognition}
+\end{figure}
+
+This process was performed for all video chunks before training, reducing the total size of the files by a factor of over 18.
+
+\subsection{Data Augmentation methods for video}
+
+In a similar manner to the contrastive learning method for audio files, various data augmentation methods were implemented. These included rotation, horizontal flipping, color jitter, conversion to grayscale, additive gaussian noise as well as time stretching (or squeezing). Example outputs of the above-mentioned data augmentation techniques are shown below.
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{video_augmentation_showcase.png}
+	\caption{Examples of Video Augmentation}
+\end{figure}
+
+\subsection{Contrastive Learning}
+
+Because of the previous positive results with the ResNet architecture, a 3D ResNet model was chosen to be trained for the contrastive learning objective of the video files. This model along with a similar projection head to the one used previously were finetuned for the purposes of the training. The loss function was again chosen to be the NT-Xent loss. Positive pairs were only the ones consisting of an original video chunk and the result of the data augmentation method that was applied to it. An Adam optimizer with weight decay and a learning rate scheduler were employed to smoothen training. Below are the results of the training.
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{training_history_video.png}
+	\caption{Results of Video Contrastive Learning}
+\end{figure}
+
+Although the validation loss curve is not smooth, it finally converges to a value around 0.03. An important thing to note is the reason the values of both validation and training loss are much lower in the case of the video than in the case of audio. This stems from the fact that a much smaller batch size of 8 (in place of the batch size of 32 in the case of audio) was used, resulting in values of the loss function being much smaller.
+\begin{thebibliography}{3}
 \bibitem{Diff-Foley}
 S. Luo, C. Yan, C. Hu and Hang Zhao,
 ``Diff-Foley: Synchronized Video-to-Audio Synthesis with Latent Diffusion Models''
