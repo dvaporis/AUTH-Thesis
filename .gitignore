@@ -18,6 +18,8 @@ lip_crop_results/
 lip_crop_results_test/
 lip_crop_results_full/
 video_contrastive_results/
+mfcc_results/
+mel_results/
 
 # Python environment
 .venv/
