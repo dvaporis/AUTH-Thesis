@@ -20,6 +20,8 @@ lip_crop_results_full/
 video_contrastive_results/
 mfcc_results/
 mel_results/
+ravdess_mel_cpc_results/
+video_frame_order_results/
 
 # Python environment
 .venv/
