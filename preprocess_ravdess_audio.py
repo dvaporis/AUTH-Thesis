@@ -5,7 +5,7 @@ Saves per-chunk files as numpy .npz with keys: 'mel' (float32, shape (128,50)),
 and writes a manifest CSV with metadata.
 
 Usage:
-    python scripts/preprocess_ravdess_audio.py --input-dir ravdess_videos_only --output-dir data/ravdess_mels_0.5s --sr 16000
+    python preprocess_ravdess_audio.py --input-dir ravdess_videos_only --output-dir data/ravdess_mels_0.5s --sr 16000
 """
 from pathlib import Path
 import argparse

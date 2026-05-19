@@ -1,9 +1,10 @@
 """Train a video encoder with frame-order verification (real vs. shuffled).
 
 Dataset:
- - Splits each clip into sliding windows of 8 frames (stride=1), covering every
-     frame in the clip. For each window we produce two examples: a "natural"
-     ordered sequence (label=1) and an "artificial" shuffled sequence (label=0).
+ - Splits each clip into sliding windows of 5 frames (stride=1), producing
+     11 possible windows from a 15-frame clip. For each window we produce two
+     examples: a "natural" ordered sequence (label=1) and an "artificial"
+     shuffled sequence (label=0).
 
 Model:
  - `torchvision.models.video.r2plus1d_18` as encoder (fc replaced with Identity,
@@ -47,8 +48,9 @@ logger = logging.getLogger(__name__)
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv"}
 
-# Use 8-frame windows as requested
-FRAMES_PER_CLIP = 8
+# Use 5-frame windows with stride 1 as requested
+FRAMES_PER_CLIP = 5
+WINDOW_STRIDE = 1
 
 
 def is_image_file(p: Path) -> bool:
@@ -133,14 +135,14 @@ class VideoFrameOrderDataset(Dataset):
                 if frame_count < self.frames_per_clip:
                     continue
                 n_windows = frame_count - self.frames_per_clip + 1
-                for s in range(n_windows):
+                for s in range(0, n_windows, WINDOW_STRIDE):
                     self.samples.append((cd, s))
             elif cd.is_dir():
                 frames = [f for f in sorted(cd.iterdir()) if f.is_file() and is_image_file(f)]
                 if len(frames) < self.frames_per_clip:
                     continue
                 n_windows = len(frames) - self.frames_per_clip + 1
-                for s in range(n_windows):
+                for s in range(0, n_windows, WINDOW_STRIDE):
                     self.samples.append((cd, s))
             else:
                 # unknown entry (neither dir nor supported video file) — skip
@@ -287,7 +289,7 @@ def validate(model, loader, criterion, device):
 def main():
     parser = argparse.ArgumentParser(description="Train video encoder on frame-order verification")
     parser.add_argument("--data-dir", type=str, default="lip_crop_results_full")
-    parser.add_argument("--frames", type=int, default=FRAMES_PER_CLIP, help="Number of frames per input window (default 8)")
+    parser.add_argument("--frames", type=int, default=FRAMES_PER_CLIP, help="Number of frames per input window (default 5)")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
