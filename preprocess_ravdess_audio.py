@@ -37,6 +37,25 @@ except Exception:
         return x
 
 
+VIDEO_EXTS = ('.mp4', '.mkv', '.mov', '.avi')
+AUDIO_EXTS = ('.wav', '.flac', '.mp3', '.ogg')
+
+
+def resolve_ffmpeg_executable():
+    ffmpeg = shutil.which('ffmpeg')
+    if ffmpeg:
+        return ffmpeg
+
+    imageio_ffmpeg = try_import('imageio_ffmpeg')
+    if imageio_ffmpeg is not None:
+        try:
+            return imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            return None
+
+    return None
+
+
 def load_audio(path: Path, sr: int):
     ext = path.suffix.lower()
     # Prefer PyAV (same approach as test_mel_reconstruction.py)
@@ -79,7 +98,7 @@ def load_audio(path: Path, sr: int):
             pass
 
     # Next, try librosa directly for common audio files; if it fails use ffmpeg extraction
-    if ext in ('.wav', '.flac', '.mp3', '.ogg'):
+    if ext in AUDIO_EXTS:
         try:
             y, _ = librosa.load(str(path), sr=sr, mono=True)
             return y
@@ -87,12 +106,13 @@ def load_audio(path: Path, sr: int):
             pass
 
     # If file is a video container or librosa failed, try using ffmpeg to extract a temporary WAV and load that.
-    if ext in ('.mp4', '.mkv', '.mov', '.avi') or True:
-        ffmpeg = shutil.which('ffmpeg')
+    ffmpeg = resolve_ffmpeg_executable()
+    if ext in VIDEO_EXTS:
         if ffmpeg is None:
-            # last resort: try librosa.load (may fail)
-            y, _ = librosa.load(str(path), sr=sr, mono=True)
-            return y
+            raise RuntimeError(
+                f"No video decode backend available for {path}. Install ffmpeg and ensure it is available "
+                "on PATH (or install imageio-ffmpeg), or install PyAV (pip install av)."
+            )
 
         tmp = None
         try:
@@ -100,15 +120,23 @@ def load_audio(path: Path, sr: int):
             tmp = tmp_f.name
             tmp_f.close()
             cmd = [ffmpeg, '-y', '-i', str(path), '-ar', str(sr), '-ac', '1', '-vn', str(tmp)]
-            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             y, _ = librosa.load(tmp, sr=sr, mono=True)
             return y
+        except subprocess.CalledProcessError as e:
+            stderr_tail = (e.stderr or '').strip().splitlines()[-10:]
+            stderr_msg = '\n'.join(stderr_tail) if stderr_tail else '<no ffmpeg stderr>'
+            raise RuntimeError(f"ffmpeg failed for {path}:\n{stderr_msg}") from e
         finally:
             if tmp is not None and os.path.exists(tmp):
                 try:
                     os.remove(tmp)
                 except Exception:
                     pass
+
+    # Last resort for other formats when ffmpeg/PyAV path is unavailable.
+    y, _ = librosa.load(str(path), sr=sr, mono=True)
+    return y
 
 
 def compute_mel(chunk, sr, n_mels, n_fft, hop_length, power=2.0):
@@ -163,7 +191,14 @@ def main():
     manifest_path = out / 'manifest.csv'
     fields = ['file', 'source', 'chunk_idx', 'start_s', 'sr']
 
-    audio_files = [p for p in inp.rglob('*') if p.suffix.lower() in ('.wav', '.flac', '.mp3', '.ogg', '.mp4', '.mkv', '.mov', '.avi')]
+    audio_files = [p for p in inp.rglob('*') if p.suffix.lower() in (AUDIO_EXTS + VIDEO_EXTS)]
+
+    has_video_inputs = any(p.suffix.lower() in VIDEO_EXTS for p in audio_files)
+    if has_video_inputs and try_import('av') is None and resolve_ffmpeg_executable() is None:
+        raise RuntimeError(
+            'Detected video inputs but neither PyAV nor ffmpeg is available in this environment. '
+            'Install one decode backend: pip install av OR install ffmpeg (or pip install imageio-ffmpeg).'
+        )
 
     all_rows = []
     for p in tqdm(audio_files, desc='Files'):
@@ -171,7 +206,7 @@ def main():
             rows = process_file(p, out, sr=args.sr, chunk_secs=args.chunk_secs, frames_per_chunk=args.frames_per_chunk, n_mels=args.n_mels, n_fft=args.n_fft)
             all_rows.extend(rows)
         except Exception as e:
-            print(f"Failed to process {p}: {e}")
+            print(f"Failed to process {p}: {type(e).__name__}: {e!r}")
             traceback.print_exc()
 
     # write manifest

@@ -27,6 +27,8 @@ video_frame_order_results/
 .venv/
 venv/
 env/
+myenv/
+pytorch-env/
 __pycache__/
 *.pyc
 *.pyo
@@ -61,3 +63,7 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.log
+
+# Slurm files
+*.sh
+*.out

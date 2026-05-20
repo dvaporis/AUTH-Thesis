@@ -1,8 +1,8 @@
 """Train audio-video alignment from pretrained CPC and frame-order encoders.
 
 Pipeline per 0.5s paired chunk:
-    video chunk -> 15 x 512 tokens from pretrained video encoder
-    -> 1D transposed convolution (15 -> 25 tokens)
+    video chunk -> 11 x 512 tokens from pretrained video encoder
+    -> 1D transposed convolution (11 -> 25 tokens)
     -> 3-layer Transformer encoder
     -> aligned video token sequence [25, 512]
 
@@ -251,38 +251,35 @@ def split_pairs(
 
 
 class VideoTokenEncoder(nn.Module):
-    """Convert a 0.5s frame chunk into a sequence of 15 latent vectors."""
+    """Convert a 0.5s frame chunk into a sequence of 11 latent vectors."""
 
-    def __init__(self, video_order_net: VideoOrderNet, window_size: int = 8):
+    def __init__(self, video_order_net: VideoOrderNet, window_size: int = 5):
         super().__init__()
         self.encoder = video_order_net.encoder
         self.window_size = int(window_size)
-        self.left_pad = self.window_size // 2 - 1
-        self.right_pad = self.window_size - 1 - self.left_pad
 
     def forward(self, video_frames: torch.Tensor) -> torch.Tensor:
         # video_frames: [B, T=15, C, H, W]
         batch, time_steps, channels, height, width = video_frames.shape
 
         x = video_frames.permute(0, 2, 1, 3, 4)  # [B, C, T, H, W]
-        x = F.pad(x, (0, 0, 0, 0, self.left_pad, self.right_pad), mode="replicate")
 
         windows = []
-        for t in range(time_steps):
+        for t in range(time_steps - self.window_size + 1):
             clip = x[:, :, t : t + self.window_size, :, :]
             windows.append(clip)
 
-        clip_batch = torch.stack(windows, dim=1)  # [B, T, C, 8, H, W]
-        clip_batch = clip_batch.reshape(batch * time_steps, channels, self.window_size, height, width)
+        clip_batch = torch.stack(windows, dim=1)  # [B, 11, C, 5, H, W]
+        clip_batch = clip_batch.reshape(batch * len(windows), channels, self.window_size, height, width)
 
         features = self.encoder(clip_batch)  # [B*T, 512]
-        return features.reshape(batch, time_steps, 512)
+        return features.reshape(batch, len(windows), 512)
 
 
 class TemporalUpsampler(nn.Module):
-    """Use 1D transposed convolution to map 15 video tokens to 25 tokens."""
+    """Use 1D transposed convolution to map 11 video tokens to 25 tokens."""
 
-    def __init__(self, dim: int = 512, in_tokens: int = 15, out_tokens: int = 25):
+    def __init__(self, dim: int = 512, in_tokens: int = 11, out_tokens: int = 25):
         super().__init__()
         if out_tokens <= in_tokens:
             raise ValueError("out_tokens must be larger than in_tokens")
@@ -299,7 +296,7 @@ class TemporalUpsampler(nn.Module):
         self.norm = nn.LayerNorm(dim)
 
     def forward(self, video_tokens: torch.Tensor) -> torch.Tensor:
-        # [B, 15, 512] -> [B, 25, 512]
+        # [B, 11, 512] -> [B, 25, 512]
         x = video_tokens.transpose(1, 2)
         x = self.deconv(x)
         x = x.transpose(1, 2)
@@ -636,7 +633,7 @@ def main() -> None:
     alignment_model = AudioVideoAlignmentModel(
         audio_model=audio_model,
         video_token_encoder=VideoTokenEncoder(video_model),
-        upsampler=TemporalUpsampler(dim=512, in_tokens=15, out_tokens=25),
+        upsampler=TemporalUpsampler(dim=512, in_tokens=11, out_tokens=25),
         transformer=VideoAlignmentTransformer(dim=512, num_layers=3, num_heads=8, dropout=0.1),
     ).to(device)
 
