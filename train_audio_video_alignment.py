@@ -351,7 +351,7 @@ class AudioVideoAlignmentModel(nn.Module):
 
 
 class TokenContrastiveAlignmentLoss(nn.Module):
-    """Symmetric InfoNCE over flattened token positions with batch negatives."""
+    """Symmetric soft InfoNCE over interleaved batch-time token positions."""
 
     def __init__(self, temperature: float = 0.07, temporal_smoothing_sigma: float = 1.0):
         super().__init__()
@@ -365,17 +365,21 @@ class TokenContrastiveAlignmentLoss(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
+        total_tokens = batch_size * time_steps
         if self.temporal_smoothing_sigma <= 0.0:
-            return torch.eye(batch_size * time_steps, device=device, dtype=dtype)
+            return torch.eye(total_tokens, device=device, dtype=dtype)
 
-        idx = torch.arange(time_steps, device=device, dtype=dtype)
-        diff = idx[:, None] - idx[None, :]
-        kernel = torch.exp(-0.5 * (diff / self.temporal_smoothing_sigma) ** 2)
-        kernel = kernel / kernel.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        token_indices = torch.arange(total_tokens, device=device)
+        batch_indices = token_indices // time_steps
+        time_indices = token_indices % time_steps
 
-        batch_eye = torch.eye(batch_size, device=device, dtype=dtype)
-        targets = batch_eye[:, None, :, None] * kernel[None, :, None, :]
-        return targets.reshape(batch_size * time_steps, batch_size * time_steps)
+        same_clip = batch_indices[:, None] == batch_indices[None, :]
+        time_diff = time_indices[:, None].to(dtype) - time_indices[None, :].to(dtype)
+        gaussian = torch.exp(-0.5 * (time_diff / self.temporal_smoothing_sigma) ** 2)
+
+        targets = torch.where(same_clip, gaussian, torch.zeros_like(gaussian))
+        targets = targets / targets.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        return targets
 
     @staticmethod
     def _soft_cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -400,14 +404,22 @@ class TokenContrastiveAlignmentLoss(nn.Module):
 
         loss_v2a = self._soft_cross_entropy(logits, targets)
         loss_a2v = self._soft_cross_entropy(logits.T, targets)
-
-        cos = 1.0 - F.cosine_similarity(video, audio, dim=1).mean()
-        return 0.5 * (loss_v2a + loss_a2v) + 0.25 * cos
+        return 0.5 * (loss_v2a + loss_a2v)
 
 
 def set_requires_grad(module: nn.Module, requires_grad: bool) -> None:
     for param in module.parameters():
         param.requires_grad = requires_grad
+
+
+def set_training_mode(model: nn.Module, trainable_modules: Optional[Sequence[nn.Module]] = None) -> None:
+    if trainable_modules is None:
+        model.train(True)
+        return
+
+    model.eval()
+    for module in trainable_modules:
+        module.train(True)
 
 
 def build_optimizer(model: nn.Module, lr: float, weight_decay: float) -> torch.optim.Optimizer:
@@ -424,9 +436,10 @@ def run_epoch(
     optimizer: Optional[torch.optim.Optimizer],
     device: torch.device,
     desc: str,
+    trainable_modules: Optional[Sequence[nn.Module]] = None,
 ) -> Dict[str, float]:
     is_train = optimizer is not None
-    model.train(is_train)
+    set_training_mode(model, trainable_modules=trainable_modules if is_train else None)
 
     total_loss = 0.0
     total_steps = 0
@@ -476,6 +489,7 @@ def train_until_converged(
     min_delta: float,
     phase_name: str,
     checkpoint_path: Path,
+    trainable_modules: Optional[Sequence[nn.Module]] = None,
 ) -> Tuple[List[Dict[str, float]], float]:
     history: List[Dict[str, float]] = []
     best_val = float("inf")
@@ -489,6 +503,7 @@ def train_until_converged(
             optimizer=optimizer,
             device=device,
             desc=f"{phase_name} Train {epoch}/{max_epochs}",
+            trainable_modules=trainable_modules,
         )
         val_metrics = run_epoch(
             model=model,
@@ -591,7 +606,7 @@ def main() -> None:
     parser.add_argument("--lr-transformer", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--temperature", type=float, default=0.07)
-    parser.add_argument("--temporal-smoothing-sigma", type=float, default=1.0)
+    parser.add_argument("--temporal-smoothing-sigma", type=float, default=1.25)
 
     parser.add_argument("--joint-epochs", type=int, default=30)
     parser.add_argument("--transformer-only-epochs", type=int, default=30)
@@ -708,6 +723,7 @@ def main() -> None:
         min_delta=args.min_delta,
         phase_name="joint",
         checkpoint_path=phase1_ckpt,
+        trainable_modules=None,
     )
     history_rows.extend(phase1_hist)
 
@@ -736,6 +752,7 @@ def main() -> None:
         min_delta=args.min_delta,
         phase_name="transformer_only",
         checkpoint_path=phase2_ckpt,
+        trainable_modules=[alignment_model.transformer],
     )
     history_rows.extend(phase2_hist)
 
