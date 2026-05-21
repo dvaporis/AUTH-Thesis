@@ -353,9 +353,34 @@ class AudioVideoAlignmentModel(nn.Module):
 class TokenContrastiveAlignmentLoss(nn.Module):
     """Symmetric InfoNCE over flattened token positions with batch negatives."""
 
-    def __init__(self, temperature: float = 0.07):
+    def __init__(self, temperature: float = 0.07, temporal_smoothing_sigma: float = 1.0):
         super().__init__()
         self.temperature = float(temperature)
+        self.temporal_smoothing_sigma = float(temporal_smoothing_sigma)
+
+    def _build_temporal_targets(
+        self,
+        batch_size: int,
+        time_steps: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if self.temporal_smoothing_sigma <= 0.0:
+            return torch.eye(batch_size * time_steps, device=device, dtype=dtype)
+
+        idx = torch.arange(time_steps, device=device, dtype=dtype)
+        diff = idx[:, None] - idx[None, :]
+        kernel = torch.exp(-0.5 * (diff / self.temporal_smoothing_sigma) ** 2)
+        kernel = kernel / kernel.sum(dim=1, keepdim=True).clamp_min(1e-12)
+
+        batch_eye = torch.eye(batch_size, device=device, dtype=dtype)
+        targets = batch_eye[:, None, :, None] * kernel[None, :, None, :]
+        return targets.reshape(batch_size * time_steps, batch_size * time_steps)
+
+    @staticmethod
+    def _soft_cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        log_probs = F.log_softmax(logits, dim=1)
+        return -(targets * log_probs).sum(dim=1).mean()
 
     def forward(self, audio_tokens: torch.Tensor, video_tokens: torch.Tensor) -> torch.Tensor:
         bsz, t, dim = audio_tokens.shape
@@ -366,10 +391,15 @@ class TokenContrastiveAlignmentLoss(nn.Module):
         video = F.normalize(video_tokens.reshape(bsz * t, dim), dim=1)
 
         logits = torch.matmul(video, audio.T) / self.temperature
-        labels = torch.arange(video.shape[0], device=video.device)
+        targets = self._build_temporal_targets(
+            batch_size=bsz,
+            time_steps=t,
+            device=video.device,
+            dtype=video.dtype,
+        )
 
-        loss_v2a = F.cross_entropy(logits, labels)
-        loss_a2v = F.cross_entropy(logits.T, labels)
+        loss_v2a = self._soft_cross_entropy(logits, targets)
+        loss_a2v = self._soft_cross_entropy(logits.T, targets)
 
         cos = 1.0 - F.cosine_similarity(video, audio, dim=1).mean()
         return 0.5 * (loss_v2a + loss_a2v) + 0.25 * cos
@@ -561,6 +591,7 @@ def main() -> None:
     parser.add_argument("--lr-transformer", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--temperature", type=float, default=0.07)
+    parser.add_argument("--temporal-smoothing-sigma", type=float, default=1.0)
 
     parser.add_argument("--joint-epochs", type=int, default=30)
     parser.add_argument("--transformer-only-epochs", type=int, default=30)
@@ -637,7 +668,10 @@ def main() -> None:
         transformer=VideoAlignmentTransformer(dim=512, num_layers=3, num_heads=8, dropout=0.1),
     ).to(device)
 
-    criterion = TokenContrastiveAlignmentLoss(temperature=args.temperature)
+    criterion = TokenContrastiveAlignmentLoss(
+        temperature=args.temperature,
+        temporal_smoothing_sigma=args.temporal_smoothing_sigma,
+    )
 
     if args.dry_run:
         sample = next(iter(train_loader))
