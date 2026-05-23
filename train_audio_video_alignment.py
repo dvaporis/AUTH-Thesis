@@ -351,7 +351,7 @@ class AudioVideoAlignmentModel(nn.Module):
 
 
 class TokenContrastiveAlignmentLoss(nn.Module):
-    """Symmetric soft InfoNCE over interleaved batch-time token positions."""
+    """Symmetric soft InfoNCE over flattened token positions with temporal smoothing."""
 
     def __init__(self, temperature: float = 0.07, temporal_smoothing_sigma: float = 1.0):
         super().__init__()
@@ -365,21 +365,17 @@ class TokenContrastiveAlignmentLoss(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        total_tokens = batch_size * time_steps
         if self.temporal_smoothing_sigma <= 0.0:
-            return torch.eye(total_tokens, device=device, dtype=dtype)
+            return torch.eye(batch_size * time_steps, device=device, dtype=dtype)
 
-        token_indices = torch.arange(total_tokens, device=device)
-        batch_indices = token_indices // time_steps
-        time_indices = token_indices % time_steps
+        time_indices = torch.arange(time_steps, device=device, dtype=dtype)
+        time_diff = time_indices[:, None] - time_indices[None, :]
+        kernel = torch.exp(-0.5 * (time_diff / self.temporal_smoothing_sigma) ** 2)
+        kernel = kernel / kernel.sum(dim=1, keepdim=True).clamp_min(1e-12)
 
-        same_clip = batch_indices[:, None] == batch_indices[None, :]
-        time_diff = time_indices[:, None].to(dtype) - time_indices[None, :].to(dtype)
-        gaussian = torch.exp(-0.5 * (time_diff / self.temporal_smoothing_sigma) ** 2)
-
-        targets = torch.where(same_clip, gaussian, torch.zeros_like(gaussian))
-        targets = targets / targets.sum(dim=1, keepdim=True).clamp_min(1e-12)
-        return targets
+        batch_eye = torch.eye(batch_size, device=device, dtype=dtype)
+        targets = batch_eye[:, None, :, None] * kernel[None, :, None, :]
+        return targets.reshape(batch_size * time_steps, batch_size * time_steps)
 
     @staticmethod
     def _soft_cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -391,6 +387,7 @@ class TokenContrastiveAlignmentLoss(nn.Module):
         if bsz < 2:
             return torch.tensor(0.0, device=audio_tokens.device, requires_grad=True)
 
+        # Normalize before similarity so the objective is driven by angular alignment.
         audio = F.normalize(audio_tokens.reshape(bsz * t, dim), dim=1)
         video = F.normalize(video_tokens.reshape(bsz * t, dim), dim=1)
 
@@ -606,7 +603,7 @@ def main() -> None:
     parser.add_argument("--lr-transformer", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--temperature", type=float, default=0.07)
-    parser.add_argument("--temporal-smoothing-sigma", type=float, default=1.25)
+    parser.add_argument("--temporal-smoothing-sigma", type=float, default=0.5)
 
     parser.add_argument("--joint-epochs", type=int, default=30)
     parser.add_argument("--transformer-only-epochs", type=int, default=30)
