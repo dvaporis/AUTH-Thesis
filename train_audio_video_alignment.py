@@ -351,56 +351,28 @@ class AudioVideoAlignmentModel(nn.Module):
 
 
 class TokenContrastiveAlignmentLoss(nn.Module):
-    """Symmetric soft InfoNCE over flattened token positions with temporal smoothing."""
+    """Symmetric temporal InfoNCE with cross-clip negatives at each time step only."""
 
     def __init__(self, temperature: float = 0.07, temporal_smoothing_sigma: float = 1.0):
         super().__init__()
         self.temperature = float(temperature)
         self.temporal_smoothing_sigma = float(temporal_smoothing_sigma)
 
-    def _build_temporal_targets(
-        self,
-        batch_size: int,
-        time_steps: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        if self.temporal_smoothing_sigma <= 0.0:
-            return torch.eye(batch_size * time_steps, device=device, dtype=dtype)
-
-        time_indices = torch.arange(time_steps, device=device, dtype=dtype)
-        time_diff = time_indices[:, None] - time_indices[None, :]
-        kernel = torch.exp(-0.5 * (time_diff / self.temporal_smoothing_sigma) ** 2)
-        kernel = kernel / kernel.sum(dim=1, keepdim=True).clamp_min(1e-12)
-
-        batch_eye = torch.eye(batch_size, device=device, dtype=dtype)
-        targets = batch_eye[:, None, :, None] * kernel[None, :, None, :]
-        return targets.reshape(batch_size * time_steps, batch_size * time_steps)
-
-    @staticmethod
-    def _soft_cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        log_probs = F.log_softmax(logits, dim=1)
-        return -(targets * log_probs).sum(dim=1).mean()
-
     def forward(self, audio_tokens: torch.Tensor, video_tokens: torch.Tensor) -> torch.Tensor:
         bsz, t, dim = audio_tokens.shape
         if bsz < 2:
             return torch.tensor(0.0, device=audio_tokens.device, requires_grad=True)
 
-        # Normalize before similarity so the objective is driven by angular alignment.
-        audio = F.normalize(audio_tokens.reshape(bsz * t, dim), dim=1)
-        video = F.normalize(video_tokens.reshape(bsz * t, dim), dim=1)
+        # Contrast is computed independently per time index, so negatives are
+        # only tokens from other clips at the same temporal position.
+        audio = F.normalize(audio_tokens, dim=2).transpose(0, 1)  # [T, B, D]
+        video = F.normalize(video_tokens, dim=2).transpose(0, 1)  # [T, B, D]
 
-        logits = torch.matmul(video, audio.T) / self.temperature
-        targets = self._build_temporal_targets(
-            batch_size=bsz,
-            time_steps=t,
-            device=video.device,
-            dtype=video.dtype,
-        )
+        logits = torch.einsum("tbd,tcd->tbc", video, audio) / self.temperature  # [T, B, B]
+        targets = torch.arange(bsz, device=audio_tokens.device, dtype=torch.long).repeat(t)
 
-        loss_v2a = self._soft_cross_entropy(logits, targets)
-        loss_a2v = self._soft_cross_entropy(logits.T, targets)
+        loss_v2a = F.cross_entropy(logits.reshape(t * bsz, bsz), targets)
+        loss_a2v = F.cross_entropy(logits.transpose(1, 2).reshape(t * bsz, bsz), targets)
         return 0.5 * (loss_v2a + loss_a2v)
 
 
