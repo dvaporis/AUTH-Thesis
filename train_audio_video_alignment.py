@@ -317,7 +317,7 @@ class VideoAlignmentTransformer(nn.Module):
             dropout=dropout,
             activation="gelu",
             batch_first=True,
-            norm_first=True,
+            norm_first=False,
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
         self.out_norm = nn.LayerNorm(dim)
@@ -600,7 +600,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--lr-joint", type=float, default=1e-4)
-    parser.add_argument("--lr-transformer", type=float, default=2e-4)
+    parser.add_argument("--lr-transformer", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--temporal-smoothing-sigma", type=float, default=0.5)
