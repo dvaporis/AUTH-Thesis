@@ -10,14 +10,14 @@ Targets:
     audio chunk -> pretrained mel CPC encoder -> 25 x 512 tokens
 
 Training schedule:
-1) Joint phase: train audio encoder + video encoder + upsampler + transformer
-   until validation loss converges (early stopping).
-2) Transformer-only phase: freeze both encoders and train only transformer
-   (and its positional embedding) until convergence.
+1) Clip-level phase: train projection heads on pooled audio/video clip embeddings
+    while keeping the pretrained backbones frozen.
+2) Token-level phase: unfreeze the token path and refine exact token alignment
+    with a hard token-level contrastive objective.
 
 Usage:
     python train_audio_video_alignment.py --dry-run
-    python train_audio_video_alignment.py --joint-epochs 40 --transformer-only-epochs 30
+    python train_audio_video_alignment.py --stage1-epochs 40 --stage2-epochs 30
 """
 
 from __future__ import annotations
@@ -335,12 +335,16 @@ class AudioVideoAlignmentModel(nn.Module):
         video_token_encoder: VideoTokenEncoder,
         upsampler: TemporalUpsampler,
         transformer: VideoAlignmentTransformer,
+        audio_projector: nn.Module,
+        video_projector: nn.Module,
     ):
         super().__init__()
         self.audio_model = audio_model
         self.video_token_encoder = video_token_encoder
         self.upsampler = upsampler
         self.transformer = transformer
+        self.audio_projector = audio_projector
+        self.video_projector = video_projector
 
     def forward(self, mel_slices: torch.Tensor, video_frames: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         audio_tokens = self.audio_model.encode_slices(mel_slices)  # [B, 25, 512]
@@ -349,31 +353,103 @@ class AudioVideoAlignmentModel(nn.Module):
         video_aligned = self.transformer(video_tokens_25)  # [B, 25, 512]
         return audio_tokens, video_aligned
 
+    def encode_clip_embeddings(self, mel_slices: torch.Tensor, video_frames: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        audio_tokens, video_tokens = self.forward(mel_slices, video_frames)
+        audio_clip = self.audio_projector(audio_tokens.mean(dim=1))
+        video_clip = self.video_projector(video_tokens.mean(dim=1))
+        return audio_clip, video_clip
 
-class TokenContrastiveAlignmentLoss(nn.Module):
-    """Symmetric temporal InfoNCE with cross-clip negatives at each time step only."""
 
-    def __init__(self, temperature: float = 0.07, temporal_smoothing_sigma: float = 1.0):
+class ProjectionHead(nn.Module):
+    def __init__(self, dim: int = 512, out_dim: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Linear(dim, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class ClipContrastiveAlignmentLoss(nn.Module):
+    """Symmetric InfoNCE over pooled clip embeddings."""
+
+    def __init__(self, temperature: float = 0.07):
         super().__init__()
         self.temperature = float(temperature)
-        self.temporal_smoothing_sigma = float(temporal_smoothing_sigma)
+
+    def forward(self, audio_clip: torch.Tensor, video_clip: torch.Tensor) -> torch.Tensor:
+        if audio_clip.shape[0] < 2:
+            return torch.tensor(0.0, device=audio_clip.device, requires_grad=True)
+
+        audio = F.normalize(audio_clip, dim=1)
+        video = F.normalize(video_clip, dim=1)
+        logits = torch.matmul(video, audio.T) / self.temperature
+        targets = torch.arange(audio.shape[0], device=audio.device)
+
+        loss_v2a = F.cross_entropy(logits, targets)
+        loss_a2v = F.cross_entropy(logits.T, targets)
+        return 0.5 * (loss_v2a + loss_a2v)
+
+
+class TokenContrastiveAlignmentLoss(nn.Module):
+    """Symmetric token-level InfoNCE with exact positives and global negatives."""
+
+    def __init__(self, temperature: float = 0.07):
+        super().__init__()
+        self.temperature = float(temperature)
 
     def forward(self, audio_tokens: torch.Tensor, video_tokens: torch.Tensor) -> torch.Tensor:
         bsz, t, dim = audio_tokens.shape
-        if bsz < 2:
-            return torch.tensor(0.0, device=audio_tokens.device, requires_grad=True)
+        num_tokens = bsz * t
 
-        # Contrast is computed independently per time index, so negatives are
-        # only tokens from other clips at the same temporal position.
-        audio = F.normalize(audio_tokens, dim=2).transpose(0, 1)  # [T, B, D]
-        video = F.normalize(video_tokens, dim=2).transpose(0, 1)  # [T, B, D]
+        audio = F.normalize(audio_tokens.reshape(num_tokens, dim), dim=1)
+        video = F.normalize(video_tokens.reshape(num_tokens, dim), dim=1)
 
-        logits = torch.einsum("tbd,tcd->tbc", video, audio) / self.temperature  # [T, B, B]
-        targets = torch.arange(bsz, device=audio_tokens.device, dtype=torch.long).repeat(t)
+        logits = torch.matmul(video, audio.T) / self.temperature  # [N, N]
+        target_weights = torch.eye(num_tokens, device=audio_tokens.device)
 
-        loss_v2a = F.cross_entropy(logits.reshape(t * bsz, bsz), targets)
-        loss_a2v = F.cross_entropy(logits.transpose(1, 2).reshape(t * bsz, bsz), targets)
+        loss_v2a = -(target_weights * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
+        loss_a2v = -(target_weights * F.log_softmax(logits.T, dim=1)).sum(dim=1).mean()
         return 0.5 * (loss_v2a + loss_a2v)
+
+
+@torch.no_grad()
+def compute_clip_retrieval_metrics(audio_clip: torch.Tensor, video_clip: torch.Tensor) -> Tuple[int, int, int]:
+    """Return clip-level top-1/top-5 retrieval counts for a batch."""
+    batch_size, dim = audio_clip.shape
+
+    audio = F.normalize(audio_clip, dim=1)
+    video = F.normalize(video_clip, dim=1)
+
+    sim = torch.matmul(video, audio.T)
+    targets = torch.arange(batch_size, device=sim.device)
+
+    top1 = int((sim.argmax(dim=1) == targets).sum().item())
+    topk = min(5, batch_size)
+    top5 = int((torch.topk(sim, topk, dim=1).indices == targets.unsqueeze(1)).any(dim=1).sum().item())
+    return top1, top5, batch_size
+
+
+@torch.no_grad()
+def compute_token_retrieval_metrics(audio_tokens: torch.Tensor, video_tokens: torch.Tensor) -> Tuple[int, int, int]:
+    """Return token-level top-1/top-5 retrieval counts for a batch."""
+    bsz, t, dim = audio_tokens.shape
+    num_tokens = bsz * t
+
+    audio = F.normalize(audio_tokens.reshape(num_tokens, dim), dim=1)
+    video = F.normalize(video_tokens.reshape(num_tokens, dim), dim=1)
+
+    sim = torch.matmul(video, audio.T)
+    targets = torch.arange(num_tokens, device=sim.device)
+
+    top1 = int((sim.argmax(dim=1) == targets).sum().item())
+    topk = min(5, num_tokens)
+    top5 = int((torch.topk(sim, topk, dim=1).indices == targets.unsqueeze(1)).any(dim=1).sum().item())
+    return top1, top5, num_tokens
 
 
 def set_requires_grad(module: nn.Module, requires_grad: bool) -> None:
@@ -401,16 +477,20 @@ def build_optimizer(model: nn.Module, lr: float, weight_decay: float) -> torch.o
 def run_epoch(
     model: AudioVideoAlignmentModel,
     loader: DataLoader,
-    criterion: TokenContrastiveAlignmentLoss,
+    criterion: nn.Module,
     optimizer: Optional[torch.optim.Optimizer],
     device: torch.device,
     desc: str,
+    objective: str,
     trainable_modules: Optional[Sequence[nn.Module]] = None,
 ) -> Dict[str, float]:
     is_train = optimizer is not None
     set_training_mode(model, trainable_modules=trainable_modules if is_train else None)
 
     total_loss = 0.0
+    total_top1 = 0
+    total_top5 = 0
+    total_tokens = 0
     total_steps = 0
 
     pbar = tqdm(loader, desc=desc, leave=False)
@@ -422,8 +502,16 @@ def run_epoch(
             optimizer.zero_grad()
 
         with torch.set_grad_enabled(is_train):
-            audio_tokens, video_tokens = model(mel_slices, video_frames)
-            loss = criterion(audio_tokens, video_tokens)
+            if objective == "clip":
+                audio_repr, video_repr = model.encode_clip_embeddings(mel_slices, video_frames)
+                loss = criterion(audio_repr, video_repr)
+                batch_top1, batch_top5, batch_count = compute_clip_retrieval_metrics(audio_repr.detach(), video_repr.detach())
+            elif objective == "token":
+                audio_tokens, video_tokens = model(mel_slices, video_frames)
+                loss = criterion(audio_tokens, video_tokens)
+                batch_top1, batch_top5, batch_count = compute_token_retrieval_metrics(audio_tokens.detach(), video_tokens.detach())
+            else:
+                raise ValueError(f"Unknown objective: {objective}")
 
             if not torch.isfinite(loss):
                 logger.warning("Skipping non-finite loss batch")
@@ -438,19 +526,30 @@ def run_epoch(
                 optimizer.step()
 
         total_loss += float(loss.item())
+        total_top1 += batch_top1
+        total_top5 += batch_top5
+        total_tokens += batch_count
         total_steps += 1
-        pbar.set_postfix(loss=f"{total_loss / max(total_steps, 1):.4f}")
+        pbar.set_postfix(
+            loss=f"{total_loss / max(total_steps, 1):.4f}",
+            top1=f"{(total_top1 / max(total_tokens, 1)):.4f}",
+            top5=f"{(total_top5 / max(total_tokens, 1)):.4f}",
+        )
 
     if total_steps == 0:
-        return {"loss": float("inf")}
-    return {"loss": total_loss / total_steps}
+        return {"loss": float("inf"), "top1_acc": 0.0, "top5_acc": 0.0}
+    return {
+        "loss": total_loss / total_steps,
+        "top1_acc": total_top1 / max(total_tokens, 1),
+        "top5_acc": total_top5 / max(total_tokens, 1),
+    }
 
 
 def train_until_converged(
     model: AudioVideoAlignmentModel,
     train_loader: DataLoader,
     val_loader: DataLoader,
-    criterion: TokenContrastiveAlignmentLoss,
+    criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     max_epochs: int,
@@ -458,6 +557,7 @@ def train_until_converged(
     min_delta: float,
     phase_name: str,
     checkpoint_path: Path,
+    objective: str,
     trainable_modules: Optional[Sequence[nn.Module]] = None,
 ) -> Tuple[List[Dict[str, float]], float]:
     history: List[Dict[str, float]] = []
@@ -472,6 +572,7 @@ def train_until_converged(
             optimizer=optimizer,
             device=device,
             desc=f"{phase_name} Train {epoch}/{max_epochs}",
+            objective=objective,
             trainable_modules=trainable_modules,
         )
         val_metrics = run_epoch(
@@ -481,23 +582,32 @@ def train_until_converged(
             optimizer=None,
             device=device,
             desc=f"{phase_name} Val {epoch}/{max_epochs}",
+            objective=objective,
         )
 
         row = {
             "phase": phase_name,
             "epoch": epoch,
             "train_loss": train_metrics["loss"],
+            "train_top1_acc": train_metrics["top1_acc"],
+            "train_top5_acc": train_metrics["top5_acc"],
             "val_loss": val_metrics["loss"],
+            "val_top1_acc": val_metrics["top1_acc"],
+            "val_top5_acc": val_metrics["top5_acc"],
         }
         history.append(row)
 
         logger.info(
-            "%s | epoch %03d/%03d | train %.4f | val %.4f",
+            "%s | epoch %03d/%03d | train %.4f top1 %.4f top5 %.4f | val %.4f top1 %.4f top5 %.4f",
             phase_name,
             epoch,
             max_epochs,
             train_metrics["loss"],
+            train_metrics["top1_acc"],
+            train_metrics["top5_acc"],
             val_metrics["loss"],
+            val_metrics["top1_acc"],
+            val_metrics["top5_acc"],
         )
 
         if val_metrics["loss"] < best_val - min_delta:
@@ -555,7 +665,19 @@ def load_video_model(checkpoint_path: Path) -> VideoOrderNet:
 def save_history(rows: List[Dict[str, float]], output_csv: Path) -> None:
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     with output_csv.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["phase", "epoch", "train_loss", "val_loss"])
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "phase",
+                "epoch",
+                "train_loss",
+                "train_top1_acc",
+                "train_top5_acc",
+                "val_loss",
+                "val_top1_acc",
+                "val_top5_acc",
+            ],
+        )
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
@@ -571,14 +693,13 @@ def main() -> None:
 
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--lr-joint", type=float, default=1e-4)
-    parser.add_argument("--lr-transformer", type=float, default=5e-5)
+    parser.add_argument("--stage1-lr", type=float, default=1e-4)
+    parser.add_argument("--stage2-lr", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--temperature", type=float, default=0.07)
-    parser.add_argument("--temporal-smoothing-sigma", type=float, default=0.5)
 
-    parser.add_argument("--joint-epochs", type=int, default=30)
-    parser.add_argument("--transformer-only-epochs", type=int, default=30)
+    parser.add_argument("--stage1-epochs", "--joint-epochs", dest="stage1_epochs", type=int, default=20)
+    parser.add_argument("--stage2-epochs", "--transformer-only-epochs", dest="stage2_epochs", type=int, default=30)
     parser.add_argument("--patience", type=int, default=6)
     parser.add_argument("--min-delta", type=float, default=1e-4)
 
@@ -650,12 +771,12 @@ def main() -> None:
         video_token_encoder=VideoTokenEncoder(video_model),
         upsampler=TemporalUpsampler(dim=512, in_tokens=11, out_tokens=25),
         transformer=VideoAlignmentTransformer(dim=512, num_layers=3, num_heads=8, dropout=0.1),
+        audio_projector=ProjectionHead(dim=512, out_dim=256),
+        video_projector=ProjectionHead(dim=512, out_dim=256),
     ).to(device)
 
-    criterion = TokenContrastiveAlignmentLoss(
-        temperature=args.temperature,
-        temporal_smoothing_sigma=args.temporal_smoothing_sigma,
-    )
+    stage1_criterion = ClipContrastiveAlignmentLoss(temperature=args.temperature)
+    stage2_criterion = TokenContrastiveAlignmentLoss(temperature=args.temperature)
 
     if args.dry_run:
         sample = next(iter(train_loader))
@@ -671,28 +792,37 @@ def main() -> None:
 
     history_rows: List[Dict[str, float]] = []
 
-    # Phase 1: jointly train both encoders + upsampler + transformer.
-    set_requires_grad(alignment_model.audio_model, True)
-    set_requires_grad(alignment_model.video_token_encoder, True)
+    # Phase 1: clip-level pretraining on pooled embeddings.
+    set_requires_grad(alignment_model.audio_model, False)
+    set_requires_grad(alignment_model.video_token_encoder, False)
     set_requires_grad(alignment_model.upsampler, True)
     set_requires_grad(alignment_model.transformer, True)
+    set_requires_grad(alignment_model.audio_projector, True)
+    set_requires_grad(alignment_model.video_projector, True)
 
-    optimizer_joint = build_optimizer(alignment_model, lr=args.lr_joint, weight_decay=args.weight_decay)
+    optimizer_stage1 = build_optimizer(alignment_model, lr=args.stage1_lr, weight_decay=args.weight_decay)
+    stage1_modules = [
+        alignment_model.audio_projector,
+        alignment_model.video_projector,
+        alignment_model.upsampler,
+        alignment_model.transformer,
+    ]
 
-    phase1_ckpt = out_dir / "phase1_best.pt"
+    phase1_ckpt = out_dir / "stage1_best.pt"
     phase1_hist, phase1_best = train_until_converged(
         model=alignment_model,
         train_loader=train_loader,
         val_loader=val_loader,
-        criterion=criterion,
-        optimizer=optimizer_joint,
+        criterion=stage1_criterion,
+        optimizer=optimizer_stage1,
         device=device,
-        max_epochs=args.joint_epochs,
+        max_epochs=args.stage1_epochs,
         patience=args.patience,
         min_delta=args.min_delta,
-        phase_name="joint",
+        phase_name="clip_pretrain",
         checkpoint_path=phase1_ckpt,
-        trainable_modules=None,
+        objective="clip",
+        trainable_modules=stage1_modules,
     )
     history_rows.extend(phase1_hist)
 
@@ -700,28 +830,37 @@ def main() -> None:
         ckpt = torch.load(phase1_ckpt, map_location=device)
         alignment_model.load_state_dict(ckpt["model_state_dict"])
 
-    # Phase 2: freeze encoders and upsampler, train transformer only.
-    set_requires_grad(alignment_model.audio_model, False)
-    set_requires_grad(alignment_model.video_token_encoder, False)
-    set_requires_grad(alignment_model.upsampler, False)
+    # Phase 2: token-level refinement.
+    set_requires_grad(alignment_model.audio_model, True)
+    set_requires_grad(alignment_model.video_token_encoder, True)
+    set_requires_grad(alignment_model.upsampler, True)
     set_requires_grad(alignment_model.transformer, True)
+    set_requires_grad(alignment_model.audio_projector, False)
+    set_requires_grad(alignment_model.video_projector, False)
 
-    optimizer_transformer = build_optimizer(alignment_model, lr=args.lr_transformer, weight_decay=args.weight_decay)
+    optimizer_stage2 = build_optimizer(alignment_model, lr=args.stage2_lr, weight_decay=args.weight_decay)
+    stage2_modules = [
+        alignment_model.audio_model,
+        alignment_model.video_token_encoder,
+        alignment_model.upsampler,
+        alignment_model.transformer,
+    ]
 
-    phase2_ckpt = out_dir / "phase2_best.pt"
+    phase2_ckpt = out_dir / "stage2_best.pt"
     phase2_hist, phase2_best = train_until_converged(
         model=alignment_model,
         train_loader=train_loader,
         val_loader=val_loader,
-        criterion=criterion,
-        optimizer=optimizer_transformer,
+        criterion=stage2_criterion,
+        optimizer=optimizer_stage2,
         device=device,
-        max_epochs=args.transformer_only_epochs,
+        max_epochs=args.stage2_epochs,
         patience=args.patience,
         min_delta=args.min_delta,
-        phase_name="transformer_only",
+        phase_name="token_refine",
         checkpoint_path=phase2_ckpt,
-        trainable_modules=[alignment_model.transformer],
+        objective="token",
+        trainable_modules=stage2_modules,
     )
     history_rows.extend(phase2_hist)
 
@@ -732,10 +871,11 @@ def main() -> None:
     test_metrics = run_epoch(
         model=alignment_model,
         loader=test_loader,
-        criterion=criterion,
+        criterion=stage2_criterion,
         optimizer=None,
         device=device,
         desc="Test",
+        objective="token",
     )
 
     save_history(history_rows, out_dir / "alignment_history.csv")
@@ -743,8 +883,8 @@ def main() -> None:
     torch.save(
         {
             "model_state_dict": alignment_model.state_dict(),
-            "phase1_best_val_loss": phase1_best,
-            "phase2_best_val_loss": phase2_best,
+            "stage1_best_val_loss": phase1_best,
+            "stage2_best_val_loss": phase2_best,
             "test_loss": test_metrics["loss"],
             "args": vars(args),
         },
@@ -755,8 +895,8 @@ def main() -> None:
         handle.write(f"test_loss={test_metrics['loss']:.6f}\n")
 
     logger.info("Done.")
-    logger.info("Best val loss (joint): %.4f", phase1_best)
-    logger.info("Best val loss (transformer_only): %.4f", phase2_best)
+    logger.info("Best val loss (clip_pretrain): %.4f", phase1_best)
+    logger.info("Best val loss (token_refine): %.4f", phase2_best)
     logger.info("Test loss: %.4f", test_metrics["loss"])
 
 
