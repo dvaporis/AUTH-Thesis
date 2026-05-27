@@ -404,16 +404,15 @@ class TokenContrastiveAlignmentLoss(nn.Module):
 
     def forward(self, audio_tokens: torch.Tensor, video_tokens: torch.Tensor) -> torch.Tensor:
         bsz, t, dim = audio_tokens.shape
-        num_tokens = bsz * t
 
-        audio = F.normalize(audio_tokens.reshape(num_tokens, dim), dim=1)
-        video = F.normalize(video_tokens.reshape(num_tokens, dim), dim=1)
+        audio = F.normalize(audio_tokens, dim=2).transpose(0, 1)  # [T, B, D]
+        video = F.normalize(video_tokens, dim=2).transpose(0, 1)  # [T, B, D]
 
-        logits = torch.matmul(video, audio.T) / self.temperature  # [N, N]
-        target_weights = torch.eye(num_tokens, device=audio_tokens.device)
+        logits = torch.einsum("tbd,tcd->tbc", video, audio) / self.temperature  # [T, B, B]
+        targets = torch.arange(bsz, device=audio_tokens.device, dtype=torch.long).repeat(t)
 
-        loss_v2a = -(target_weights * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
-        loss_a2v = -(target_weights * F.log_softmax(logits.T, dim=1)).sum(dim=1).mean()
+        loss_v2a = F.cross_entropy(logits.reshape(t * bsz, bsz), targets)
+        loss_a2v = F.cross_entropy(logits.transpose(1, 2).reshape(t * bsz, bsz), targets)
         return 0.5 * (loss_v2a + loss_a2v)
 
 
@@ -436,20 +435,20 @@ def compute_clip_retrieval_metrics(audio_clip: torch.Tensor, video_clip: torch.T
 
 @torch.no_grad()
 def compute_token_retrieval_metrics(audio_tokens: torch.Tensor, video_tokens: torch.Tensor) -> Tuple[int, int, int]:
-    """Return token-level top-1/top-5 retrieval counts for a batch."""
+    """Return per-time-step token-level top-1/top-5 retrieval counts for a batch."""
     bsz, t, dim = audio_tokens.shape
-    num_tokens = bsz * t
 
-    audio = F.normalize(audio_tokens.reshape(num_tokens, dim), dim=1)
-    video = F.normalize(video_tokens.reshape(num_tokens, dim), dim=1)
+    audio = F.normalize(audio_tokens, dim=2).transpose(0, 1)  # [T, B, D]
+    video = F.normalize(video_tokens, dim=2).transpose(0, 1)  # [T, B, D]
 
-    sim = torch.matmul(video, audio.T)
-    targets = torch.arange(num_tokens, device=sim.device)
+    sim = torch.einsum("tbd,tcd->tbc", video, audio)  # [T, B, B]
+    targets = torch.arange(bsz, device=sim.device).repeat(t)
 
-    top1 = int((sim.argmax(dim=1) == targets).sum().item())
-    topk = min(5, num_tokens)
-    top5 = int((torch.topk(sim, topk, dim=1).indices == targets.unsqueeze(1)).any(dim=1).sum().item())
-    return top1, top5, num_tokens
+    flat_sim = sim.reshape(t * bsz, bsz)
+    top1 = int((flat_sim.argmax(dim=1) == targets).sum().item())
+    topk = min(5, bsz)
+    top5 = int((torch.topk(flat_sim, topk, dim=1).indices == targets.unsqueeze(1)).any(dim=1).sum().item())
+    return top1, top5, bsz * t
 
 
 def set_requires_grad(module: nn.Module, requires_grad: bool) -> None:
