@@ -603,7 +603,7 @@ def run_epoch(
 
             t = torch.randint(0, diffusion.timesteps, (mel.shape[0],), device=device, dtype=torch.long)
 
-            with torch.cuda.amp.autocast(enabled=autocast_enabled):
+            with torch.autocast(device_type="cuda", enabled=autocast_enabled):
                 loss = diffusion.p_losses(diffusion_model, mel, t, cond_tokens)
 
             if not torch.isfinite(loss):
@@ -646,6 +646,15 @@ def save_history(rows: List[Dict[str, float]], output_csv: Path) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
+
+
+def create_grad_scaler(enabled: bool):
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        try:
+            return torch.amp.GradScaler("cuda", enabled=enabled)
+        except TypeError:
+            return torch.amp.GradScaler(enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
 def main() -> None:
@@ -751,7 +760,7 @@ def main() -> None:
     )
 
     amp_enabled = (not args.no_amp) and (device.type == "cuda")
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    scaler = create_grad_scaler(enabled=amp_enabled)
 
     if args.dry_run:
         batch = next(iter(train_loader))
