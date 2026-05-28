@@ -14,7 +14,7 @@ Conditioning pipeline:
 
 Diffusion model:
     DDPM-style epsilon prediction on mel "images" [1, 128, 50],
-    conditioned via pooled video tokens.
+    conditioned via cross-attention over the full video token sequence.
 
 Usage:
     python train_video_conditioned_mel_diffusion.py --dry-run
@@ -377,6 +377,43 @@ class FiLMResBlock(nn.Module):
         return h + self.skip(x)
 
 
+class CrossAttention(nn.Module):
+    """Cross-attention from mel feature queries to video token keys/values."""
+
+    def __init__(self, dim: int, context_dim: int, heads: int = 4, dim_head: int = 32):
+        super().__init__()
+        self.heads = int(heads)
+        self.dim_head = int(dim_head)
+        inner_dim = self.heads * self.dim_head
+
+        self.norm_q = nn.LayerNorm(dim)
+        self.norm_ctx = nn.LayerNorm(context_dim)
+
+        self.to_q = nn.Linear(dim, inner_dim, bias=False)
+        self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
+        self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
+        self.to_out = nn.Linear(inner_dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        # x: [B, N, C], context: [B, T, D]
+        bsz, n_tokens, _ = x.shape
+
+        q = self.to_q(self.norm_q(x))
+        k = self.to_k(self.norm_ctx(context))
+        v = self.to_v(self.norm_ctx(context))
+
+        q = q.view(bsz, n_tokens, self.heads, self.dim_head).transpose(1, 2)
+        k = k.view(bsz, context.shape[1], self.heads, self.dim_head).transpose(1, 2)
+        v = v.view(bsz, context.shape[1], self.heads, self.dim_head).transpose(1, 2)
+
+        scale = self.dim_head ** -0.5
+        attn = torch.softmax(torch.matmul(q, k.transpose(-2, -1)) * scale, dim=-1)
+        out = torch.matmul(attn, v)
+
+        out = out.transpose(1, 2).contiguous().view(bsz, n_tokens, self.heads * self.dim_head)
+        return self.to_out(out)
+
+
 class MelConditionedUNet(nn.Module):
     """Small conditioned U-Net for noise prediction epsilon_theta(x_t, t, cond)."""
 
@@ -390,19 +427,13 @@ class MelConditionedUNet(nn.Module):
             nn.Linear(self.time_dim, self.time_dim),
         )
 
-        self.cond_pool = nn.Sequential(
-            nn.LayerNorm(cond_dim),
-            nn.Linear(cond_dim, self.time_dim),
-            nn.SiLU(),
-            nn.Linear(self.time_dim, self.time_dim),
-        )
-
         self.in_conv = nn.Conv2d(1, base_channels, kernel_size=3, padding=1)
 
         self.down1 = FiLMResBlock(base_channels, base_channels, self.time_dim)
         self.down2 = FiLMResBlock(base_channels, base_channels * 2, self.time_dim)
 
         self.mid = FiLMResBlock(base_channels * 2, base_channels * 2, self.time_dim)
+        self.mid_cross_attn = CrossAttention(dim=base_channels * 2, context_dim=cond_dim, heads=4, dim_head=32)
 
         self.up2 = FiLMResBlock(base_channels * 4, base_channels, self.time_dim)
         self.up1 = FiLMResBlock(base_channels * 2, base_channels, self.time_dim)
@@ -413,9 +444,7 @@ class MelConditionedUNet(nn.Module):
     def forward(self, x_t: torch.Tensor, t: torch.Tensor, cond_tokens: torch.Tensor) -> torch.Tensor:
         t_emb = sinusoidal_embedding(t, self.time_dim)
         t_emb = self.time_mlp(t_emb)
-
-        cond_emb = self.cond_pool(cond_tokens.mean(dim=1))
-        emb = t_emb + cond_emb
+        emb = t_emb
 
         x0 = self.in_conv(x_t)
         d1 = self.down1(x0, emb)
@@ -425,6 +454,12 @@ class MelConditionedUNet(nn.Module):
 
         x = F.avg_pool2d(d2, kernel_size=2, stride=2, ceil_mode=True)
         x = self.mid(x, emb)
+
+        # Inject full temporal conditioning sequence at the bottleneck.
+        bsz, channels, height, width = x.shape
+        x_seq = x.flatten(2).transpose(1, 2)  # [B, H*W, C]
+        x_seq = x_seq + self.mid_cross_attn(x_seq, cond_tokens)
+        x = x_seq.transpose(1, 2).reshape(bsz, channels, height, width)
 
         x = F.interpolate(x, size=d2.shape[-2:], mode="bilinear", align_corners=False)
         x = torch.cat([x, d2], dim=1)
