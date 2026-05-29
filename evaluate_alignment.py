@@ -25,6 +25,7 @@ from train_audio_video_alignment import (
     VideoTokenEncoder,
     TemporalUpsampler,
     VideoAlignmentTransformer,
+    ProjectionHead,
 )
 
 
@@ -37,6 +38,8 @@ def build_alignment_model(audio_ckpt: Path, video_ckpt: Path, device: torch.devi
         video_token_encoder=VideoTokenEncoder(video_model),
         upsampler=TemporalUpsampler(dim=512, in_tokens=11, out_tokens=25),
         transformer=VideoAlignmentTransformer(dim=512, num_layers=3, num_heads=8, dropout=0.1),
+        audio_projector=ProjectionHead(dim=512, out_dim=256),
+        video_projector=ProjectionHead(dim=512, out_dim=256),
     )
     return model.to(device)
 
