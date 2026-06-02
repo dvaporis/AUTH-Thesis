@@ -1,43 +1,82 @@
 """
-Mel Spectrogram Reconstruction Test Script
+Mel spectrogram reconstruction test script.
 
 Process:
-1. Extract audio from RAVDESS dataset.
-2. Select a 0.5s high-energy speech segment.
-3. Compute mel spectrograms with increasing mel resolution.
-4. Reconstruct audio from each mel spectrogram.
-5. Save all reconstructed clips and quality summaries.
+1. Extract the full audio clip from a RAVDESS video.
+2. Build a mel spectrogram for the entire clip.
+3. Save the waveform, mel features, and a visual comparison.
+4. Reconstruct audio with a neural vocoder when available.
+5. Report comparison metrics such as MSE, SNR, and correlation.
 """
 
+import argparse
 import csv
+import importlib.util
+import json
 import logging
 import random
+import sys
 from pathlib import Path
 from typing import Optional, Tuple
 
 import av
 import librosa
+import librosa.display
 import matplotlib.pyplot as plt
 import numpy as np
 import soundfile as sf
+import torch
+from dataclasses import dataclass
+
+HIFI_GAN_REPO = Path("hifi-gan")
+if HIFI_GAN_REPO.exists():
+    sys.path.insert(0, str(HIFI_GAN_REPO.resolve()))
+
+
+def load_hifigan_module(module_name: str, file_name: str):
+    module_path = HIFI_GAN_REPO / file_name
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load {module_name} from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+env_module = load_hifigan_module("hifigan_env", "env.py")
+meldataset = load_hifigan_module("hifigan_meldataset", "meldataset.py")
+models = load_hifigan_module("hifigan_models", "models.py")
+
+AttrDict = env_module.AttrDict
+MAX_WAV_VALUE = meldataset.MAX_WAV_VALUE
+Generator = models.Generator
+
+_mel_basis_cache: dict[str, torch.Tensor] = {}
+_hann_window_cache: dict[str, torch.Tensor] = {}
+
+
+def _spectral_normalize_torch(magnitudes: torch.Tensor) -> torch.Tensor:
+    return torch.log(torch.clamp(magnitudes, min=1e-5))
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
+@dataclass
 class MelConfig:
-    """Mel reconstruction configuration for short speech clips."""
+    """Mel reconstruction configuration for the provided HiFi-GAN model."""
 
-    sample_rate: int = 16000
-    chunk_duration: float = 0.5
-    n_fft: int = 400
-    hop_length: int = 160
-    f_min: float = 80.0
-    f_max: float = 7600.0
-
-    # Sweep from coarse to fine mel resolution.
-    mel_sweep: tuple[int, ...] = (16, 24, 32, 40, 48, 64, 80, 96, 128, 160, 192, 256)
+    sample_rate: int = 22050
+    n_fft: int = 1024
+    hop_length: int = 256
+    win_size: int = 1024
+    f_min: float = 0.0
+    f_max: float = 8000.0
+    n_mels: int = 80
+    max_duration: Optional[float] = None
+    config_file: Path = Path("UNIVERSAL_V1/config.json")
+    checkpoint_file: Path = Path("UNIVERSAL_V1/g_02500000")
 
 
 def extract_audio_from_video(video_path: Path, target_sr: int = 16000) -> Tuple[Optional[np.ndarray], int]:
@@ -63,7 +102,11 @@ def extract_audio_from_video(video_path: Path, target_sr: int = 16000) -> Tuple[
             return None, target_sr
 
         audio_full = np.concatenate(audio_frames, axis=0)
-        audio_full = audio_full.astype(np.float32) / (2**15 if audio_full.dtype == np.int16 else 1.0)
+        if np.issubdtype(audio_full.dtype, np.integer):
+            max_val = float(2 ** (8 * audio_full.dtype.itemsize - 1))
+            audio_full = audio_full.astype(np.float32) / max_val
+        else:
+            audio_full = audio_full.astype(np.float32)
         if audio_full.ndim > 1:
             audio_full = audio_full.mean(axis=1)
 
@@ -76,6 +119,87 @@ def extract_audio_from_video(video_path: Path, target_sr: int = 16000) -> Tuple[
         return None, target_sr
 
 
+def get_full_audio_clip(audio: np.ndarray, sr: int, max_duration: Optional[float] = None) -> np.ndarray:
+    """Return the full clip, optionally truncating to a maximum duration."""
+    if max_duration is None:
+        return audio
+
+    max_samples = int(max_duration * sr)
+    if max_samples <= 0:
+        return audio
+    return audio[:max_samples]
+
+
+def load_hifigan_model(config_file: Path, checkpoint_file: Path, device: torch.device) -> tuple[Generator, AttrDict]:
+    if not config_file.exists():
+        raise FileNotFoundError(f"HiFi-GAN config not found: {config_file}")
+    if not checkpoint_file.exists():
+        raise FileNotFoundError(f"HiFi-GAN checkpoint not found: {checkpoint_file}")
+
+    h = AttrDict(json.loads(config_file.read_text(encoding="utf-8")))
+    generator = Generator(h).to(device)
+    checkpoint = torch.load(checkpoint_file, map_location=device)
+    if not isinstance(checkpoint, dict) or "generator" not in checkpoint:
+        raise RuntimeError(f"Unexpected checkpoint format: {checkpoint_file}")
+
+    generator.load_state_dict(checkpoint["generator"])
+    generator.eval()
+    generator.remove_weight_norm()
+    return generator, h
+
+
+def compute_hifigan_mel(audio: np.ndarray, h: AttrDict, device: torch.device) -> torch.Tensor:
+    """Compute the mel tensor expected by the provided HiFi-GAN model."""
+    audio_tensor = torch.FloatTensor(audio).to(device)
+    if audio_tensor.dim() == 1:
+        audio_tensor = audio_tensor.unsqueeze(0)
+
+    cache_key = f"{h.sampling_rate}_{h.n_fft}_{h.num_mels}_{h.fmin}_{h.fmax}_{device}"
+    if cache_key not in _mel_basis_cache:
+        mel = librosa.filters.mel(
+            sr=h.sampling_rate,
+            n_fft=h.n_fft,
+            n_mels=h.num_mels,
+            fmin=h.fmin,
+            fmax=h.fmax,
+        )
+        _mel_basis_cache[cache_key] = torch.from_numpy(mel).float().to(device)
+        _hann_window_cache[str(device)] = torch.hann_window(h.win_size).to(device)
+
+    mel_basis = _mel_basis_cache[cache_key]
+    hann_window = _hann_window_cache[str(device)]
+
+    audio_tensor = torch.nn.functional.pad(
+        audio_tensor.unsqueeze(1),
+        (int((h.n_fft - h.hop_size) / 2), int((h.n_fft - h.hop_size) / 2)),
+        mode="reflect",
+    ).squeeze(1)
+
+    spec = torch.stft(
+        audio_tensor,
+        h.n_fft,
+        hop_length=h.hop_size,
+        win_length=h.win_size,
+        window=hann_window,
+        center=False,
+        pad_mode="reflect",
+        normalized=False,
+        onesided=True,
+        return_complex=True,
+    )
+    spec = torch.sqrt(spec.abs().pow(2) + 1e-9)
+    mel = torch.matmul(mel_basis, spec)
+    mel = _spectral_normalize_torch(mel)
+    return mel
+
+
+def reconstruct_audio_with_hifigan(mel_tensor: torch.Tensor, generator: Generator) -> np.ndarray:
+    """Run the provided HiFi-GAN generator on a full-clip mel tensor."""
+    with torch.no_grad():
+        audio = generator(mel_tensor).squeeze().detach().cpu().numpy()
+    return audio.astype(np.float32)
+
+
 def find_ravdess_video_files() -> list[Path]:
     """Find all RAVDESS videos under the expected local folder."""
     ravdess_path = Path("ravdess_videos_only")
@@ -84,35 +208,6 @@ def find_ravdess_video_files() -> list[Path]:
         for ext in [".mp4", ".avi", ".mov", ".mkv"]:
             video_files.extend(ravdess_path.rglob(f"*{ext}"))
     return sorted(video_files)
-
-
-def find_speech_segment(audio: np.ndarray, sr: int, duration: float = 0.5) -> np.ndarray:
-    """Return the highest-energy window of the requested duration."""
-    num_samples = int(duration * sr)
-    if len(audio) < num_samples:
-        return np.pad(audio, (0, num_samples - len(audio)))
-
-    hop = max(1, num_samples // 4)
-    frames = librosa.util.frame(audio, frame_length=num_samples, hop_length=hop)
-    rms = librosa.feature.rms(y=audio, frame_length=num_samples, hop_length=hop)
-    best_idx = int(np.argmax(rms))
-    return frames[:, best_idx]
-
-
-def reconstruct_audio_from_mel(mel_spec: np.ndarray, config: MelConfig, num_iters: int = 64) -> np.ndarray:
-    """Invert mel spectrogram back to waveform via Griffin-Lim."""
-    audio_recon = librosa.feature.inverse.mel_to_audio(
-        mel_spec,
-        sr=config.sample_rate,
-        n_fft=config.n_fft,
-        hop_length=config.hop_length,
-        n_iter=num_iters,
-        fmin=config.f_min,
-        fmax=config.f_max,
-        window="hann",
-        power=2.0,
-    )
-    return librosa.util.normalize(audio_recon)
 
 
 def align_audio_lengths(reference: np.ndarray, candidate: np.ndarray) -> np.ndarray:
@@ -139,7 +234,18 @@ def evaluate_reconstruction(reference: np.ndarray, reconstruction: np.ndarray) -
 
 
 def main() -> None:
-    config = MelConfig()
+    parser = argparse.ArgumentParser(description="Reconstruct full-clip audio with the provided HiFi-GAN model")
+    parser.add_argument("--max-duration", type=float, default=None, help="Optional maximum clip duration in seconds")
+    parser.add_argument("--config-file", type=str, default=str(MelConfig.config_file), help="Path to the HiFi-GAN config.json")
+    parser.add_argument("--checkpoint-file", type=str, default=str(MelConfig.checkpoint_file), help="Path to the HiFi-GAN generator checkpoint")
+    parser.add_argument("--output-dir", type=str, default="mel_results", help="Directory for saved outputs")
+    args = parser.parse_args()
+
+    config = MelConfig(
+        max_duration=args.max_duration,
+        config_file=Path(args.config_file),
+        checkpoint_file=Path(args.checkpoint_file),
+    )
     video_files = find_ravdess_video_files()
 
     if not video_files:
@@ -152,79 +258,69 @@ def main() -> None:
         logger.error(f"Could not extract audio from selected file: {selected_video}")
         return
 
-    audio_chunk = find_speech_segment(audio, sr, duration=config.chunk_duration)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    generator, h = load_hifigan_model(config.config_file, config.checkpoint_file, device)
 
-    out_dir = Path("mel_results")
+    audio_clip = get_full_audio_clip(audio, sr, config.max_duration)
+    audio_clip = librosa.util.normalize(audio_clip) * 0.95
+
+    if sr != h.sampling_rate:
+        audio_clip = librosa.resample(audio_clip, orig_sr=sr, target_sr=h.sampling_rate)
+        sr = h.sampling_rate
+
+    out_dir = Path(args.output_dir)
     out_dir.mkdir(exist_ok=True)
-    sf.write(out_dir / "original.wav", audio_chunk, sr)
+    sf.write(out_dir / "original.wav", audio_clip, sr)
 
-    valid_sweep = sorted({n for n in config.mel_sweep if n > 0})
-    results: list[dict[str, float | int]] = []
-    waveform_examples: list[tuple[int, np.ndarray]] = []
+    mel_tensor = compute_hifigan_mel(audio_clip, h, device)
+    mel_np = mel_tensor.squeeze(0).detach().cpu().numpy().astype(np.float32)
+    mel_npy = out_dir / "full_clip_hifigan_mel.npy"
+    np.save(mel_npy, mel_np)
 
-    logger.info(f"Running mel sweep for bins: {valid_sweep}")
-    for n_mels in valid_sweep:
-        mel_spec = librosa.feature.melspectrogram(
-            y=audio_chunk,
-            sr=sr,
-            n_fft=config.n_fft,
-            hop_length=config.hop_length,
-            n_mels=n_mels,
-            fmin=config.f_min,
-            fmax=config.f_max,
-            power=2.0,
-        )
+    audio_reconstructed = reconstruct_audio_with_hifigan(mel_tensor, generator)
+    audio_reconstructed = align_audio_lengths(audio_clip, audio_reconstructed)
+    sf.write(out_dir / "reconstructed_hifigan.wav", audio_reconstructed, sr)
 
-        audio_reconstructed = reconstruct_audio_from_mel(mel_spec, config)
-        audio_reconstructed = align_audio_lengths(audio_chunk, audio_reconstructed)
+    metrics = evaluate_reconstruction(audio_clip, audio_reconstructed)
+    metrics["n_mels"] = h.num_mels
+    metrics["samples"] = len(audio_clip)
+    metrics["sample_rate"] = sr
 
-        metrics = evaluate_reconstruction(audio_chunk, audio_reconstructed)
-        metrics["n_mels"] = n_mels
-        results.append(metrics)
-
-        sf.write(out_dir / f"reconstructed_mel_{n_mels:03d}.wav", audio_reconstructed, sr)
-        logger.info(
-            f"Saved reconstructed_mel_{n_mels:03d}.wav | "
-            f"SNR={metrics['snr_db']:.2f} dB, Corr={metrics['corr']:.4f}, MSE={metrics['mse']:.6f}"
-        )
-
-        if n_mels in (valid_sweep[0], valid_sweep[len(valid_sweep) // 2], valid_sweep[-1]):
-            waveform_examples.append((n_mels, audio_reconstructed.copy()))
-
-    results.sort(key=lambda x: float(x["snr_db"]), reverse=True)
-
-    metrics_csv = out_dir / "reconstruction_mel_sweep_metrics.csv"
+    metrics_csv = out_dir / "reconstruction_metrics.csv"
     with open(metrics_csv, "w", newline="", encoding="utf-8") as file_obj:
-        writer = csv.DictWriter(file_obj, fieldnames=["n_mels", "snr_db", "corr", "mse"])
+        writer = csv.DictWriter(file_obj, fieldnames=["n_mels", "samples", "sample_rate", "snr_db", "corr", "mse"])
         writer.writeheader()
-        for row in results:
-            writer.writerow(row)
+        writer.writerow(metrics)
 
-    summary_txt = out_dir / "reconstruction_mel_sweep_summary.txt"
+    summary_txt = out_dir / "reconstruction_summary.txt"
     with open(summary_txt, "w", encoding="utf-8") as file_obj:
         file_obj.write(f"Selected file: {selected_video}\n")
-        file_obj.write(f"Clip duration: {config.chunk_duration:.2f}s | Sample rate: {sr} Hz\n")
-        file_obj.write("\nRanked by SNR (higher is better):\n")
-        for row in results:
-            file_obj.write(
-                f"MEL={int(row['n_mels']):>3d} | "
-                f"SNR={float(row['snr_db']):.2f} dB | "
-                f"Corr={float(row['corr']):.4f} | "
-                f"MSE={float(row['mse']):.6f}\n"
-            )
+        file_obj.write(f"Clip duration: {len(audio_clip) / sr:.2f}s | Sample rate: {sr} Hz\n")
+        file_obj.write(f"Mel bins: {h.num_mels}\n")
+        file_obj.write(f"HiFi-GAN config: {config.config_file}\n")
+        file_obj.write(f"HiFi-GAN checkpoint: {config.checkpoint_file}\n")
+        file_obj.write("\nMetrics:\n")
+        file_obj.write(f"MSE: {metrics['mse']:.6f}\n")
+        file_obj.write(f"SNR: {metrics['snr_db']:.2f} dB\n")
+        file_obj.write(f"Corr: {metrics['corr']:.4f}\n")
+        file_obj.write(f"Samples: {metrics['samples']}\n")
 
-    if waveform_examples:
-        plt.figure(figsize=(10, 8))
-        for idx, (n_mels, waveform) in enumerate(waveform_examples, start=1):
-            plt.subplot(len(waveform_examples), 1, idx)
-            librosa.display.waveshow(audio_chunk, sr=sr, alpha=0.5, label="Original")
-            librosa.display.waveshow(waveform, sr=sr, alpha=0.5, label=f"Recon MEL={n_mels}", color="r")
-            plt.legend(loc="upper right")
-            plt.title(f"Waveform Comparison (MEL={n_mels})")
-        plt.tight_layout()
-        plt.savefig(out_dir / "comparison_mel_sweep_waveforms.png")
+    plt.figure(figsize=(12, 8))
+    plt.subplot(2, 1, 1)
+    librosa.display.waveshow(audio_clip, sr=sr, alpha=0.8, label="Original")
+    librosa.display.waveshow(audio_reconstructed, sr=sr, alpha=0.6, label="Reconstructed (HiFi-GAN)", color="r")
+    plt.legend(loc="upper right")
+    plt.title("Waveform Comparison")
+
+    plt.subplot(2, 1, 2)
+    img = librosa.display.specshow(mel_np, sr=sr, hop_length=h.hop_size, x_axis="time", y_axis="mel", fmin=h.fmin, fmax=h.fmax, cmap="magma")
+    plt.colorbar(img, format="%+2.0f")
+    plt.title("Full-Clip HiFi-GAN Mel Spectrogram")
+    plt.tight_layout()
+    plt.savefig(out_dir / "comparison_full_clip.png", dpi=180, bbox_inches="tight")
 
     logger.info(f"Done! Files saved to {out_dir.absolute()}")
+    logger.info(f"Mel NPY: {mel_npy}")
     logger.info(f"Metrics CSV: {metrics_csv}")
     logger.info(f"Summary TXT: {summary_txt}")
 
