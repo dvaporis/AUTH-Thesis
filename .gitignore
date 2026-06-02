@@ -5,6 +5,7 @@ kaggle_datasets/
 ravdess_videos_only
 data/
 s1/
+s1_lip_crops/
 
 # Models
 hifi-gan/
@@ -30,6 +31,7 @@ ravdess_mel_cpc_results/
 video_frame_order_results/
 video_conditioned_mel_diffusion_results/
 video_conditioned_mel_diffusion_eval/
+visual_lstm_ctc_results
 
 # Python environment
 .venv/

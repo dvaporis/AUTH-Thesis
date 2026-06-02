@@ -33,7 +33,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from torchvision import models, transforms
+from torchvision import models
+from torchvision.transforms import v2
 from tqdm import tqdm
 
 
@@ -51,7 +52,7 @@ class TrainingConfig:
     num_epochs: int = 20
     learning_rate: float = 1e-4
     weight_decay: float = 1e-4
-    hidden_dim: int = 512
+    hidden_dim: int = 256
     lstm_layers: int = 2
     train_ratio: float = 0.6
     val_ratio: float = 0.2
@@ -78,6 +79,11 @@ def normalize_stem(path: Path) -> str:
     return stem
 
 
+def normalize_csv_file_field(file_field: str) -> str:
+    filename = file_field.replace("\\", "/").rsplit("/", 1)[-1]
+    return Path(filename).stem
+
+
 def load_phoneme_targets(csv_path: Path) -> Dict[str, List[str]]:
     if not csv_path.exists():
         raise FileNotFoundError(f"Phoneme CSV not found: {csv_path}")
@@ -91,7 +97,7 @@ def load_phoneme_targets(csv_path: Path) -> Dict[str, List[str]]:
             if not file_field or not phoneme_field:
                 continue
 
-            key = Path(file_field).stem
+            key = normalize_csv_file_field(file_field)
             targets[key] = phoneme_field.split()
 
     if not targets:
@@ -129,7 +135,7 @@ def split_samples(samples: List[Sample], train_ratio: float, val_ratio: float, t
 
 
 class LipPhonemeDataset(Dataset):
-    def __init__(self, samples: Sequence[Sample], vocab: Sequence[str], frame_size: int = 224, frame_stride: int = 1):
+    def __init__(self, samples: Sequence[Sample], vocab: Sequence[str], frame_size: int = 224, frame_stride: int = 1, augment: bool = False):
         if frame_stride < 1:
             raise ValueError("frame_stride must be >= 1")
 
@@ -138,11 +144,21 @@ class LipPhonemeDataset(Dataset):
         self.frame_stride = int(frame_stride)
         self.token_to_id = {token: index + 1 for index, token in enumerate(vocab)}
         self.blank_id = 0
-        self.transforms = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.Resize((self.frame_size, self.frame_size)),
-            transforms.ToTensor(),
+        self.is_training = bool(augment)
+        self.train_transforms, self.val_transforms = self._build_transforms()
+
+    def _build_transforms(self) -> Tuple[v2.Compose, v2.Compose]:
+        train_transforms = v2.Compose([
+            v2.Resize((self.frame_size, self.frame_size), interpolation=v2.InterpolationMode.BILINEAR),
+            v2.RandomHorizontalFlip(p=0.5),
+            v2.RandomApply([v2.ColorJitter(brightness=0.1, contrast=0.1)], p=0.3),
+            v2.ToDtype(torch.float32, scale=True),
         ])
+        val_transforms = v2.Compose([
+            v2.Resize((self.frame_size, self.frame_size), interpolation=v2.InterpolationMode.BILINEAR),
+            v2.ToDtype(torch.float32, scale=True),
+        ])
+        return train_transforms, val_transforms
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -164,7 +180,7 @@ class LipPhonemeDataset(Dataset):
                     continue
 
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                frame_tensor = self.transforms(frame_rgb)
+                frame_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).contiguous()
                 frames.append(frame_tensor)
                 frame_index += 1
         finally:
@@ -173,7 +189,12 @@ class LipPhonemeDataset(Dataset):
         if not frames:
             raise RuntimeError(f"No frames decoded from {video_path}")
 
-        return torch.stack(frames, dim=0)  # [T, C, H, W]
+        video = torch.stack(frames, dim=0)  # [T, C, H, W]
+        if self.is_training:
+            video = self.train_transforms(video)
+        else:
+            video = self.val_transforms(video)
+        return video
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         sample = self.samples[index]
@@ -221,7 +242,7 @@ def collate_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tenso
 
 
 class FrameEncoder(nn.Module):
-    def __init__(self, hidden_dim: int = 512, pretrained: bool = True, finetune: bool = True):
+    def __init__(self, hidden_dim: int = 256, pretrained: bool = True, finetune: bool = True):
         super().__init__()
         weights = models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
         backbone = models.resnet18(weights=weights)
@@ -230,7 +251,7 @@ class FrameEncoder(nn.Module):
         self.projector = nn.Sequential(
             nn.Linear(512, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.1),
+            nn.Dropout(0.2),
         )
 
         if not finetune:
@@ -243,7 +264,7 @@ class FrameEncoder(nn.Module):
 
 
 class VisualLSTMCTC(nn.Module):
-    def __init__(self, vocab_size: int, hidden_dim: int = 512, lstm_layers: int = 2, pretrained_backbone: bool = True, finetune_backbone: bool = True):
+    def __init__(self, vocab_size: int, hidden_dim: int = 256, lstm_layers: int = 2, pretrained_backbone: bool = True, finetune_backbone: bool = True):
         super().__init__()
         self.frame_encoder = FrameEncoder(hidden_dim=hidden_dim, pretrained=pretrained_backbone, finetune=finetune_backbone)
         self.lstm = nn.LSTM(
@@ -252,7 +273,7 @@ class VisualLSTMCTC(nn.Module):
             num_layers=lstm_layers,
             batch_first=True,
             bidirectional=True,
-            dropout=0.1 if lstm_layers > 1 else 0.0,
+            dropout=0.2 if lstm_layers > 1 else 0.0,
         )
         self.classifier = nn.Linear(hidden_dim * 2, vocab_size)
 
@@ -423,12 +444,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--hidden-dim", type=int, default=512)
+    parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--lstm-layers", type=int, default=2)
     parser.add_argument("--frame-size", type=int, default=224)
     parser.add_argument("--frame-stride", type=int, default=1)
     parser.add_argument("--freeze-backbone", action="store_true")
     parser.add_argument("--no-pretrained", action="store_true")
+    parser.add_argument("--lr-factor", type=float, default=0.5)
+    parser.add_argument("--lr-patience", type=int, default=2)
+    parser.add_argument("--min-lr", type=float, default=1e-6)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dry-run", action="store_true")
     return parser
@@ -466,9 +490,9 @@ def main() -> None:
     with (output_dir / "phoneme_vocab.json").open("w", encoding="utf-8") as handle:
         json.dump({"blank_id": 0, "blank_token": DEFAULT_BLANK_TOKEN, "tokens": vocab}, handle, ensure_ascii=False, indent=2)
 
-    train_dataset = LipPhonemeDataset(train_samples, vocab=vocab, frame_size=args.frame_size, frame_stride=args.frame_stride)
-    val_dataset = LipPhonemeDataset(val_samples, vocab=vocab, frame_size=args.frame_size, frame_stride=args.frame_stride)
-    test_dataset = LipPhonemeDataset(test_samples, vocab=vocab, frame_size=args.frame_size, frame_stride=args.frame_stride)
+    train_dataset = LipPhonemeDataset(train_samples, vocab=vocab, frame_size=args.frame_size, frame_stride=args.frame_stride, augment=True)
+    val_dataset = LipPhonemeDataset(val_samples, vocab=vocab, frame_size=args.frame_size, frame_stride=args.frame_stride, augment=False)
+    test_dataset = LipPhonemeDataset(test_samples, vocab=vocab, frame_size=args.frame_size, frame_stride=args.frame_stride, augment=False)
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=collate_batch)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=collate_batch)
@@ -484,6 +508,14 @@ def main() -> None:
 
     criterion = nn.CTCLoss(blank=0, zero_infinity=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=args.lr_factor,
+        patience=args.lr_patience,
+        threshold=TrainingConfig.early_stopping_min_delta,
+        min_lr=args.min_lr,
+    )
 
     logger.info("Loaded %d samples (%d train / %d val / %d test)", len(samples), len(train_samples), len(val_samples), len(test_samples))
     logger.info("Phoneme vocabulary size: %d (+ blank)", len(vocab))
@@ -505,7 +537,7 @@ def main() -> None:
 
     best_val_loss = float("inf")
     epochs_without_improvement = 0
-    history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "val_ter": []}
+    history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "val_ter": [], "lr": []}
 
     for epoch in range(1, args.epochs + 1):
         train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
@@ -514,14 +546,18 @@ def main() -> None:
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_metrics["loss"])
         history["val_ter"].append(val_metrics["token_error_rate"])
+        scheduler.step(val_metrics["loss"])
+        current_lr = float(optimizer.param_groups[0]["lr"])
+        history["lr"].append(current_lr)
 
         logger.info(
-            "Epoch %03d/%03d | train_loss=%.4f | val_loss=%.4f | val_TER=%.4f",
+            "Epoch %03d/%03d | train_loss=%.4f | val_loss=%.4f | val_TER=%.4f | lr=%.2e",
             epoch,
             args.epochs,
             train_loss,
             val_metrics["loss"],
             val_metrics["token_error_rate"],
+            current_lr,
         )
 
         improved = val_metrics["loss"] < (best_val_loss - TrainingConfig.early_stopping_min_delta)
