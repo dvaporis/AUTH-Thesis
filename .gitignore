@@ -4,6 +4,12 @@ kaggle_datasets/
 **/.cache/
 ravdess_videos_only
 data/
+s1/
+
+# Models
+hifi-gan/
+hifi-gan/__pycache__/
+UNIVERSAL_V1/
 
 # Results and outputs
 audio_encodec_results/
