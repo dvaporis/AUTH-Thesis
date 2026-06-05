@@ -26,7 +26,7 @@ import torch
 from huggingface_hub import hf_hub_download
 
 
-VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi")
+VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".mpeg", ".mpg")
 AUDIO_EXTS = (".wav", ".flac", ".mp3", ".ogg")
 
 
