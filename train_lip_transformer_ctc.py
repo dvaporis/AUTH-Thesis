@@ -26,7 +26,6 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from train_lip_lstm_ctc import (
     DEFAULT_BLANK_TOKEN,
-    Conv3DFrontEnd,
     FrameEncoder,
     LipPhonemeDataset,
     TrainingConfig,
@@ -92,19 +91,13 @@ class VisualTransformerCTC(nn.Module):
         feedforward_multiplier: int = 4,
         pretrained_backbone: bool = True,
         finetune_backbone: bool = True,
-        encoder_type: str = "2d",
     ):
         super().__init__()
-        if encoder_type == "3dconv":
-            self.frame_encoder = Conv3DFrontEnd(hidden_dim=hidden_dim)
-            self.encoder_is_3d = True
-        else:
-            self.frame_encoder = FrameEncoder(
-                hidden_dim=hidden_dim,
-                pretrained=pretrained_backbone,
-                finetune=finetune_backbone,
-            )
-            self.encoder_is_3d = False
+        self.frame_encoder = FrameEncoder(
+            hidden_dim=hidden_dim,
+            pretrained=pretrained_backbone,
+            finetune=finetune_backbone,
+        )
 
         self.positional_encoding = SinusoidalPositionalEncoding(hidden_dim, dropout=transformer_dropout)
         encoder_layer = nn.TransformerEncoderLayer(
@@ -121,9 +114,6 @@ class VisualTransformerCTC(nn.Module):
         self.classifier = nn.Linear(hidden_dim, vocab_size)
 
     def _encode_frames(self, videos: torch.Tensor) -> torch.Tensor:
-        if self.encoder_is_3d:
-            return self.frame_encoder(videos)
-
         batch_size, time_steps, channels, height, width = videos.shape
         flat_frames = videos.reshape(batch_size * time_steps, channels, height, width)
         frame_features = self.frame_encoder(flat_frames)
@@ -153,13 +143,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--frame-size", type=int, default=224)
     parser.add_argument("--frame-stride", type=int, default=1)
-    parser.add_argument("--encoder-type", choices=["2d", "3dconv"], default="2d", help="Front-end encoder type")
     parser.add_argument("--transformer-layers", type=int, default=4)
     parser.add_argument("--transformer-heads", type=int, default=8)
     parser.add_argument("--transformer-dropout", type=float, default=0.1)
     parser.add_argument("--transformer-feedforward-multiplier", type=int, default=4)
     parser.add_argument("--freeze-backbone", action="store_true")
     parser.add_argument("--no-pretrained", action="store_true")
+    parser.add_argument("--warmup-epochs", type=int, default=3, help="Linearly warm up the learning rate for this many epochs")
     parser.add_argument("--lr-factor", type=float, default=0.5)
     parser.add_argument("--lr-patience", type=int, default=2)
     parser.add_argument("--min-lr", type=float, default=1e-6)
@@ -260,7 +250,6 @@ def main() -> None:
         feedforward_multiplier=args.transformer_feedforward_multiplier,
         pretrained_backbone=not args.no_pretrained,
         finetune_backbone=not args.freeze_backbone,
-        encoder_type=args.encoder_type,
     ).to(device)
 
     criterion = nn.CTCLoss(blank=0, zero_infinity=True)
@@ -276,6 +265,10 @@ def main() -> None:
 
     logger.info("Loaded %d samples (%d train / %d val / %d test)", len(samples), len(train_samples), len(val_samples), len(test_samples))
     logger.info("Phoneme vocabulary size: %d (+ blank)", len(vocab))
+    if args.warmup_epochs > 0:
+        logger.info("Learning rate schedule: linear warmup for %d epoch(s), then ReduceLROnPlateau", args.warmup_epochs)
+    else:
+        logger.info("Learning rate schedule: ReduceLROnPlateau")
 
     if args.dry_run:
         batch = next(iter(train_loader))
@@ -297,13 +290,20 @@ def main() -> None:
     history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "val_ter": [], "lr": []}
 
     for epoch in range(1, args.epochs + 1):
+        if args.warmup_epochs > 0 and epoch <= args.warmup_epochs:
+            warmup_factor = epoch / float(args.warmup_epochs)
+            current_lr = args.lr * warmup_factor
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = current_lr
+
         train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
         val_metrics = validate(model, val_loader, criterion, device, id_to_token)
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_metrics["loss"])
         history["val_ter"].append(val_metrics["token_error_rate"])
-        scheduler.step(val_metrics["loss"])
+        if args.warmup_epochs <= 0 or epoch > args.warmup_epochs:
+            scheduler.step(val_metrics["loss"])
         current_lr = float(optimizer.param_groups[0]["lr"])
         history["lr"].append(current_lr)
 

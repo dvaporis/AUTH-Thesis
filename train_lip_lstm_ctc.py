@@ -206,21 +206,21 @@ class LipPhonemeDataset(Dataset):
         # Additional lightweight augmentations applied per-video during training
         if self.is_training:
             # brightness jitter
-            b_factor = 1.0 + (random.random() * 0.2 - 0.1)
+            b_factor = 1.0 + (torch.rand(1).item() * 0.2 - 0.1)
             video = video * float(b_factor)
 
             # contrast jitter
             mean = video.mean(dim=(1, 2, 3), keepdim=True)
-            c_factor = 1.0 + (random.random() * 0.2 - 0.1)
+            c_factor = 1.0 + (torch.rand(1).item() * 0.2 - 0.1)
             video = (video - mean) * float(c_factor) + mean
 
             # random erasing (simple rectangular mask)
-            if random.random() < 0.2:
+            if torch.rand(1).item() < 0.2:
                 t, c, h, w = video.shape
-                rect_h = max(1, int(h * (0.08 + random.random() * 0.15)))
-                rect_w = max(1, int(w * (0.08 + random.random() * 0.15)))
-                y = random.randint(0, max(0, h - rect_h))
-                x = random.randint(0, max(0, w - rect_w))
+                rect_h = max(1, int(h * (0.08 + torch.rand(1).item() * 0.15)))
+                rect_w = max(1, int(w * (0.08 + torch.rand(1).item() * 0.15)))
+                y = int(torch.randint(0, max(1, h - rect_h + 1), (1,)).item())
+                x = int(torch.randint(0, max(1, w - rect_w + 1), (1,)).item())
                 video[:, :, y : y + rect_h, x : x + rect_w] = 0.0
         return video
 
@@ -386,15 +386,9 @@ class Conv3DFrontEnd(nn.Module):
 
 
 class VisualLSTMCTC(nn.Module):
-    def __init__(self, vocab_size: int, hidden_dim: int = 256, lstm_layers: int = 2, pretrained_backbone: bool = True, finetune_backbone: bool = True, encoder_type: str = "2d"):
+    def __init__(self, vocab_size: int, hidden_dim: int = 256, lstm_layers: int = 2, pretrained_backbone: bool = True, finetune_backbone: bool = True):
         super().__init__()
-        # Choose front-end: 2D per-frame encoder (ResNet18) or 3D conv front-end
-        if encoder_type == "3dconv":
-            self.frame_encoder = Conv3DFrontEnd(hidden_dim=hidden_dim, pretrained=pretrained_backbone, finetune=finetune_backbone)
-            self.encoder_is_3d = True
-        else:
-            self.frame_encoder = FrameEncoder(hidden_dim=hidden_dim, pretrained=pretrained_backbone, finetune=finetune_backbone)
-            self.encoder_is_3d = False
+        self.frame_encoder = FrameEncoder(hidden_dim=hidden_dim, pretrained=pretrained_backbone, finetune=finetune_backbone)
         self.lstm = nn.LSTM(
             input_size=hidden_dim,
             hidden_size=hidden_dim,
@@ -407,14 +401,10 @@ class VisualLSTMCTC(nn.Module):
 
     def forward(self, videos: torch.Tensor, video_lengths: torch.Tensor) -> torch.Tensor:
         # videos: B, T, C, H, W
-        if self.encoder_is_3d:
-            # Conv3DFrontEnd expects (B, T, C, H, W) and returns (B, T, hidden_dim)
-            sequence_features = self.frame_encoder(videos)
-        else:
-            batch_size, time_steps, channels, height, width = videos.shape
-            flat_frames = videos.reshape(batch_size * time_steps, channels, height, width)
-            frame_features = self.frame_encoder(flat_frames)
-            sequence_features = frame_features.reshape(batch_size, time_steps, -1)
+        batch_size, time_steps, channels, height, width = videos.shape
+        flat_frames = videos.reshape(batch_size * time_steps, channels, height, width)
+        frame_features = self.frame_encoder(flat_frames)
+        sequence_features = frame_features.reshape(batch_size, time_steps, -1)
         # Ensure video_lengths match the temporal length after the encoder
         seq_len = int(sequence_features.shape[1])
         if video_lengths.max().item() > seq_len:
@@ -793,7 +783,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lstm-layers", type=int, default=2)
     parser.add_argument("--frame-size", type=int, default=224)
     parser.add_argument("--frame-stride", type=int, default=1)
-    parser.add_argument("--encoder-type", choices=["2d", "3dconv"], default="2d", help="Front-end encoder type: 2d per-frame or 3d conv")
     parser.add_argument("--freeze-backbone", action="store_true")
     parser.add_argument("--no-pretrained", action="store_true")
     parser.add_argument("--lr-factor", type=float, default=0.5)
@@ -870,7 +859,6 @@ def main() -> None:
         lstm_layers=args.lstm_layers,
         pretrained_backbone=not args.no_pretrained,
         finetune_backbone=not args.freeze_backbone,
-        encoder_type=args.encoder_type,
     ).to(device)
 
     criterion = nn.CTCLoss(blank=0, zero_infinity=True)
