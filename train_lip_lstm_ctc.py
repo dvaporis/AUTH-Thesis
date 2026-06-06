@@ -290,11 +290,111 @@ class FrameEncoder(nn.Module):
         features = self.backbone(frames)
         return self.projector(features)
 
+class Conv3DFrontEnd(nn.Module):
+    """3D convolutional front-end that can use a small custom conv stack
+    or a pretrained video ResNet (R3D-18). The forward pass returns
+    per-frame features shaped (B, T, hidden_dim).
+
+    Input: videos tensor shaped (B, T, C, H, W)
+    Output: per-frame features shaped (B, T, hidden_dim)
+    """
+
+    def __init__(self, hidden_dim: int = 256, pretrained: bool = False, finetune: bool = True):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.use_backbone = False
+
+        if pretrained:
+            # Use torchvision's R3D-18 pretrained on Kinetics (if available)
+            weights = models.video.R3D_18_Weights.KINETICS400_V1
+            backbone = models.video.r3d_18(weights=weights)
+
+            # The backbone still reduces temporal resolution internally, so we
+            # interpolate the features back to the input frame count before CTC.
+            self.backbone3d = backbone
+            self.use_backbone = True
+
+            # projector from backbone channels (512) to hidden_dim
+            self.projector = nn.Sequential(
+                nn.Linear(512, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.2),
+            )
+
+            if not finetune:
+                for parameter in self.backbone3d.parameters():
+                    parameter.requires_grad = False
+        else:
+            # Lightweight custom 3D conv stack (same as before)
+            self.net = nn.Sequential(
+                nn.Conv3d(3, 64, kernel_size=(5, 7, 7), stride=(1, 2, 2), padding=(2, 3, 3)),
+                nn.BatchNorm3d(64),
+                nn.ReLU(inplace=True),
+                nn.MaxPool3d(kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1)),
+                nn.Conv3d(64, 128, kernel_size=3, stride=1, padding=1),
+                nn.BatchNorm3d(128),
+                nn.ReLU(inplace=True),
+                nn.Conv3d(128, 256, kernel_size=3, stride=1, padding=1),
+                nn.BatchNorm3d(256),
+                nn.ReLU(inplace=True),
+            )
+
+            self.projector = nn.Sequential(
+                nn.Linear(256, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.2),
+            )
+
+    def forward(self, videos: torch.Tensor) -> torch.Tensor:
+        # videos: B, T, C, H, W -> Conv3d expects B, C, T, H, W
+        x = videos.permute(0, 2, 1, 3, 4)
+        original_temporal_length = int(x.shape[2])
+
+        if self.use_backbone:
+            # Run through R3D trunk: stem -> layer1..layer4
+            # This reduces temporal resolution, so we restore it afterward.
+            x = self.backbone3d.stem(x)
+            x = self.backbone3d.layer1(x)
+            x = self.backbone3d.layer2(x)
+            x = self.backbone3d.layer3(x)
+            x = self.backbone3d.layer4(x)
+
+            # x: B, C_out, T, H', W' -> average pool spatial dims only
+            x = x.mean(dim=[3, 4])
+
+            # x: B, C_out, T_reduced -> interpolate back to the input length.
+            if int(x.shape[2]) != original_temporal_length:
+                x = F.interpolate(x, size=original_temporal_length, mode="linear", align_corners=False)
+
+            # x: B, C_out, T -> permute to B, T, C_out
+            x = x.permute(0, 2, 1)
+            b, t, c = x.shape
+            x_flat = x.reshape(b * t, c)
+            projected = self.projector(x_flat)
+            projected = projected.reshape(b, t, -1)
+            return projected
+
+        # Fallback to custom net
+        x = self.net(x)
+        x = x.mean(dim=[3, 4])
+        x = x.permute(0, 2, 1)
+        b, t, c = x.shape
+        x_flat = x.reshape(b * t, c)
+        projected = self.projector(x_flat)
+        projected = projected.reshape(b, t, -1)
+        return projected
+
 
 class VisualLSTMCTC(nn.Module):
-    def __init__(self, vocab_size: int, hidden_dim: int = 256, lstm_layers: int = 2, pretrained_backbone: bool = True, finetune_backbone: bool = True):
+    def __init__(self, vocab_size: int, hidden_dim: int = 256, lstm_layers: int = 2, pretrained_backbone: bool = True, finetune_backbone: bool = True, encoder_type: str = "2d"):
         super().__init__()
-        self.frame_encoder = FrameEncoder(hidden_dim=hidden_dim, pretrained=pretrained_backbone, finetune=finetune_backbone)
+        # Choose front-end: 2D per-frame encoder (ResNet18) or 3D conv front-end
+        if encoder_type == "3dconv":
+            self.frame_encoder = Conv3DFrontEnd(hidden_dim=hidden_dim, pretrained=pretrained_backbone, finetune=finetune_backbone)
+            self.encoder_is_3d = True
+        else:
+            self.frame_encoder = FrameEncoder(hidden_dim=hidden_dim, pretrained=pretrained_backbone, finetune=finetune_backbone)
+            self.encoder_is_3d = False
         self.lstm = nn.LSTM(
             input_size=hidden_dim,
             hidden_size=hidden_dim,
@@ -306,17 +406,27 @@ class VisualLSTMCTC(nn.Module):
         self.classifier = nn.Linear(hidden_dim * 2, vocab_size)
 
     def forward(self, videos: torch.Tensor, video_lengths: torch.Tensor) -> torch.Tensor:
-        batch_size, time_steps, channels, height, width = videos.shape
-        flat_frames = videos.reshape(batch_size * time_steps, channels, height, width)
-        frame_features = self.frame_encoder(flat_frames)
-        sequence_features = frame_features.reshape(batch_size, time_steps, -1)
+        # videos: B, T, C, H, W
+        if self.encoder_is_3d:
+            # Conv3DFrontEnd expects (B, T, C, H, W) and returns (B, T, hidden_dim)
+            sequence_features = self.frame_encoder(videos)
+        else:
+            batch_size, time_steps, channels, height, width = videos.shape
+            flat_frames = videos.reshape(batch_size * time_steps, channels, height, width)
+            frame_features = self.frame_encoder(flat_frames)
+            sequence_features = frame_features.reshape(batch_size, time_steps, -1)
+        # Ensure video_lengths match the temporal length after the encoder
+        seq_len = int(sequence_features.shape[1])
+        if video_lengths.max().item() > seq_len:
+            logger.warning("Encoder reduced temporal length from %d to %d; clamping video_lengths", int(video_lengths.max().item()), seq_len)
+        adjusted_lengths = torch.clamp(video_lengths, max=seq_len)
 
-        packed = nn.utils.rnn.pack_padded_sequence(sequence_features, video_lengths.cpu(), batch_first=True, enforce_sorted=False)
+        packed = nn.utils.rnn.pack_padded_sequence(sequence_features, adjusted_lengths.cpu(), batch_first=True, enforce_sorted=False)
         packed_output, _ = self.lstm(packed)
         lstm_output, _ = nn.utils.rnn.pad_packed_sequence(packed_output, batch_first=True)
 
         logits = self.classifier(lstm_output)
-        return logits
+        return logits, adjusted_lengths
 
 
 def decode_greedy(logits: torch.Tensor, blank_id: int = 0) -> List[int]:
@@ -406,15 +516,15 @@ def evaluate_batch(model: VisualLSTMCTC, batch: Dict[str, torch.Tensor | List[st
     targets = batch["targets"].to(device)
     target_lengths = batch["target_lengths"].to(device)
 
-    logits = model(videos, video_lengths)
+    logits, adjusted_lengths = model(videos, video_lengths)
     log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)
-    loss = criterion(log_probs, targets, video_lengths, target_lengths)
+    loss = criterion(log_probs, targets, adjusted_lengths, target_lengths)
 
     target_chunks = split_target_and_lengths(targets.cpu(), target_lengths.cpu())
     predicted_texts: List[str] = []
     target_texts: List[str] = []
     for item_index in range(logits.shape[0]):
-        pred_ids = decode_greedy(logits[item_index, : int(video_lengths[item_index])].cpu(), blank_id=0)
+        pred_ids = decode_greedy(logits[item_index, : int(adjusted_lengths[item_index])].cpu(), blank_id=0)
         predicted_texts.append(tokens_to_text(pred_ids, id_to_token))
         target_texts.append(tokens_to_text(target_chunks[item_index].tolist(), id_to_token))
 
@@ -468,9 +578,9 @@ def train_epoch(model: VisualLSTMCTC, loader: DataLoader, criterion: nn.CTCLoss,
         targets = batch["targets"].to(device)
         target_lengths = batch["target_lengths"].to(device)
 
-        logits = model(videos, video_lengths)
+        logits, adjusted_lengths = model(videos, video_lengths)
         log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)
-        loss = criterion(log_probs, targets, video_lengths, target_lengths)
+        loss = criterion(log_probs, targets, adjusted_lengths, target_lengths)
 
         if not torch.isfinite(loss):
             logger.warning("Skipping non-finite loss batch")
@@ -683,6 +793,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lstm-layers", type=int, default=2)
     parser.add_argument("--frame-size", type=int, default=224)
     parser.add_argument("--frame-stride", type=int, default=1)
+    parser.add_argument("--encoder-type", choices=["2d", "3dconv"], default="2d", help="Front-end encoder type: 2d per-frame or 3d conv")
     parser.add_argument("--freeze-backbone", action="store_true")
     parser.add_argument("--no-pretrained", action="store_true")
     parser.add_argument("--lr-factor", type=float, default=0.5)
@@ -759,6 +870,7 @@ def main() -> None:
         lstm_layers=args.lstm_layers,
         pretrained_backbone=not args.no_pretrained,
         finetune_backbone=not args.freeze_backbone,
+        encoder_type=args.encoder_type,
     ).to(device)
 
     criterion = nn.CTCLoss(blank=0, zero_infinity=True)
@@ -782,9 +894,9 @@ def main() -> None:
         targets = batch["targets"].to(device)
         target_lengths = batch["target_lengths"].to(device)
         with torch.no_grad():
-            logits = model(videos, video_lengths)
+            logits, adjusted_lengths = model(videos, video_lengths)
             log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)
-            loss = criterion(log_probs, targets, video_lengths, target_lengths)
+            loss = criterion(log_probs, targets, adjusted_lengths, target_lengths)
         logger.info("Dry run videos shape: %s", tuple(videos.shape))
         logger.info("Dry run logits shape: %s", tuple(logits.shape))
         logger.info("Dry run CTC loss: %.6f", float(loss.item()))
