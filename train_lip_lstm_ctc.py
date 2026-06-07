@@ -26,6 +26,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+import math
 
 import matplotlib
 import cv2
@@ -434,6 +435,82 @@ def decode_greedy(logits: torch.Tensor, blank_id: int = 0) -> List[int]:
     return collapsed
 
 
+def decode_beam(logits: torch.Tensor, beam_size: int = 10, blank_id: int = 0) -> List[int]:
+    """CTC prefix beam search over a single-example logits tensor.
+
+    Uses separate blank / non-blank prefix probabilities and exact CTC
+    recurrence updates, then prunes to `beam_size` prefixes each time-step.
+    """
+
+    def _log_add(left: float, right: float) -> float:
+        if left == -float("inf"):
+            return right
+        if right == -float("inf"):
+            return left
+        if left > right:
+            return left + math.log1p(math.exp(right - left))
+        return right + math.log1p(math.exp(left - right))
+
+    def _prefix_score(pb: float, pnb: float) -> float:
+        return _log_add(pb, pnb)
+
+    # logits: [T, V]
+    if logits.numel() == 0:
+        return []
+
+    log_probs = F.log_softmax(logits, dim=-1).detach().cpu()
+    time_steps, vocab_size = log_probs.shape
+
+    # prefix -> (p_blank, p_non_blank), in log-space
+    beams: Dict[Tuple[int, ...], Tuple[float, float]] = {(): (0.0, -float("inf"))}
+
+    for t in range(time_steps):
+        next_beams: Dict[Tuple[int, ...], Tuple[float, float]] = {}
+        row = log_probs[t].tolist()
+
+        for prefix, (p_blank, p_non_blank) in beams.items():
+            prefix_total = _prefix_score(p_blank, p_non_blank)
+
+            # Extend with blank: prefix stays unchanged.
+            n_blank, n_non_blank = next_beams.get(prefix, (-float("inf"), -float("inf")))
+            n_blank = _log_add(n_blank, prefix_total + float(row[blank_id]))
+            next_beams[prefix] = (n_blank, n_non_blank)
+
+            last_token = prefix[-1] if prefix else None
+            for token_id in range(vocab_size):
+                if token_id == blank_id:
+                    continue
+
+                token_logp = float(row[token_id])
+                if token_id == last_token:
+                    # Repeating last token without an intermediate blank keeps prefix.
+                    n_blank_same, n_non_blank_same = next_beams.get(prefix, (-float("inf"), -float("inf")))
+                    n_non_blank_same = _log_add(n_non_blank_same, p_non_blank + token_logp)
+                    next_beams[prefix] = (n_blank_same, n_non_blank_same)
+
+                    # Transition from blank allows appending the same symbol.
+                    repeated_prefix = prefix + (token_id,)
+                    r_blank, r_non_blank = next_beams.get(repeated_prefix, (-float("inf"), -float("inf")))
+                    r_non_blank = _log_add(r_non_blank, p_blank + token_logp)
+                    next_beams[repeated_prefix] = (r_blank, r_non_blank)
+                else:
+                    new_prefix = prefix + (token_id,)
+                    n_blank_new, n_non_blank_new = next_beams.get(new_prefix, (-float("inf"), -float("inf")))
+                    n_non_blank_new = _log_add(n_non_blank_new, prefix_total + token_logp)
+                    next_beams[new_prefix] = (n_blank_new, n_non_blank_new)
+
+        # Prune to top beam_size prefixes by total score.
+        ranked = sorted(
+            next_beams.items(),
+            key=lambda item: _prefix_score(item[1][0], item[1][1]),
+            reverse=True,
+        )
+        beams = dict(ranked[: max(1, int(beam_size))])
+
+    best_prefix = max(beams.items(), key=lambda x: _prefix_score(x[1][0], x[1][1]))[0]
+    return list(best_prefix)
+
+
 def tokens_to_text(token_ids: List[int], id_to_token: Dict[int, str], blank_id: int = 0) -> str:
     tokens = [id_to_token[token_id] for token_id in token_ids if token_id != blank_id and token_id in id_to_token]
     return " ".join(tokens).strip()
@@ -500,7 +577,7 @@ def align_token_sequences(reference: Sequence[str], hypothesis: Sequence[str]) -
 
 
 @torch.no_grad()
-def evaluate_batch(model: VisualLSTMCTC, batch: Dict[str, torch.Tensor | List[str]], criterion: nn.CTCLoss, device: torch.device, id_to_token: Dict[int, str]) -> Tuple[float, List[str], List[str]]:
+def evaluate_batch(model: VisualLSTMCTC, batch: Dict[str, torch.Tensor | List[str]], criterion: nn.CTCLoss, device: torch.device, id_to_token: Dict[int, str], beam_size: int = 1) -> Tuple[float, List[str], List[str]]:
     videos = batch["videos"].to(device)
     video_lengths = batch["video_lengths"].to(device)
     targets = batch["targets"].to(device)
@@ -514,7 +591,11 @@ def evaluate_batch(model: VisualLSTMCTC, batch: Dict[str, torch.Tensor | List[st
     predicted_texts: List[str] = []
     target_texts: List[str] = []
     for item_index in range(logits.shape[0]):
-        pred_ids = decode_greedy(logits[item_index, : int(adjusted_lengths[item_index])].cpu(), blank_id=0)
+        single_logits = logits[item_index, : int(adjusted_lengths[item_index])].cpu()
+        if beam_size > 1:
+            pred_ids = decode_beam(single_logits, beam_size=beam_size, blank_id=0)
+        else:
+            pred_ids = decode_greedy(single_logits, blank_id=0)
         predicted_texts.append(tokens_to_text(pred_ids, id_to_token))
         target_texts.append(tokens_to_text(target_chunks[item_index].tolist(), id_to_token))
 
@@ -528,6 +609,7 @@ def evaluate_loader_with_sequences(
     criterion: nn.CTCLoss,
     device: torch.device,
     id_to_token: Dict[int, str],
+    beam_size: int = 1,
 ) -> Tuple[Dict[str, float], List[str], List[str]]:
     model.eval()
     total_loss = 0.0
@@ -538,7 +620,7 @@ def evaluate_loader_with_sequences(
     all_targets: List[str] = []
 
     for batch in tqdm(loader, desc="Test", leave=False):
-        loss, predictions, targets = evaluate_batch(model, batch, criterion, device, id_to_token)
+        loss, predictions, targets = evaluate_batch(model, batch, criterion, device, id_to_token, beam_size=beam_size)
         total_loss += loss
         num_batches += 1
         all_predictions.extend(predictions)
@@ -556,8 +638,7 @@ def evaluate_loader_with_sequences(
     }
     return metrics, all_predictions, all_targets
 
-
-def train_epoch(model: VisualLSTMCTC, loader: DataLoader, criterion: nn.CTCLoss, optimizer: torch.optim.Optimizer, device: torch.device) -> float:
+def train_epoch(model: VisualLSTMCTC, loader: DataLoader, criterion: nn.CTCLoss, optimizer: torch.optim.Optimizer, device: torch.device, label_smoothing: float = 0.0) -> float:
     model.train()
     total_loss = 0.0
     num_batches = 0
@@ -569,8 +650,22 @@ def train_epoch(model: VisualLSTMCTC, loader: DataLoader, criterion: nn.CTCLoss,
         target_lengths = batch["target_lengths"].to(device)
 
         logits, adjusted_lengths = model(videos, video_lengths)
+        # log_probs for CTC: (T, B, V)
         log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)
         loss = criterion(log_probs, targets, adjusted_lengths, target_lengths)
+
+        # Confidence penalty / label-smoothing via entropy regularization.
+        # We minimize (CTC_loss - alpha * entropy) so the optimizer is encouraged
+        # to increase predictive entropy when alpha > 0.
+        if label_smoothing and label_smoothing > 0.0:
+            probs = F.softmax(logits, dim=-1)
+            max_time = probs.shape[1]
+            mask = (torch.arange(max_time, device=device).unsqueeze(0) < video_lengths.unsqueeze(1)).to(probs.dtype)
+            # entropy per time-step: (B, T)
+            entropy = -(probs * (probs + 1e-9).log()).sum(dim=-1)
+            masked_entropy = entropy * mask
+            mean_entropy = masked_entropy.sum() / max(1.0, mask.sum())
+            loss = loss - float(label_smoothing) * mean_entropy
 
         if not torch.isfinite(loss):
             logger.warning("Skipping non-finite loss batch")
@@ -588,7 +683,7 @@ def train_epoch(model: VisualLSTMCTC, loader: DataLoader, criterion: nn.CTCLoss,
 
 
 @torch.no_grad()
-def validate(model: VisualLSTMCTC, loader: DataLoader, criterion: nn.CTCLoss, device: torch.device, id_to_token: Dict[int, str]) -> Dict[str, float]:
+def validate(model: VisualLSTMCTC, loader: DataLoader, criterion: nn.CTCLoss, device: torch.device, id_to_token: Dict[int, str], beam_size: int = 1) -> Dict[str, float]:
     model.eval()
     total_loss = 0.0
     num_batches = 0
@@ -596,7 +691,7 @@ def validate(model: VisualLSTMCTC, loader: DataLoader, criterion: nn.CTCLoss, de
     total_token_errors = 0
 
     for batch in tqdm(loader, desc="Val", leave=False):
-        loss, predictions, targets = evaluate_batch(model, batch, criterion, device, id_to_token)
+        loss, predictions, targets = evaluate_batch(model, batch, criterion, device, id_to_token, beam_size=beam_size)
         total_loss += loss
         num_batches += 1
 
@@ -791,6 +886,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--class-aware-sampling", action="store_true", help="Use class-aware (weighted) sampling based on phoneme inverse frequency for training")
+    parser.add_argument("--label-smoothing", type=float, default=0.0, help="Confidence penalty (entropy) coefficient to discourage over-confident predictions")
+    parser.add_argument("--beam-size", type=int, default=1, help="If >1, use CTC beam search decoding with this beam size during evaluation")
     return parser
 
 
@@ -895,8 +992,8 @@ def main() -> None:
     history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "val_ter": [], "lr": []}
 
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
-        val_metrics = validate(model, val_loader, criterion, device, id_to_token)
+        train_loss = train_epoch(model, train_loader, criterion, optimizer, device, label_smoothing=args.label_smoothing)
+        val_metrics = validate(model, val_loader, criterion, device, id_to_token, beam_size=args.beam_size)
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_metrics["loss"])
@@ -952,6 +1049,7 @@ def main() -> None:
         criterion,
         device,
         id_to_token,
+        beam_size=args.beam_size,
     )
     matrix, _, per_phoneme_report, top_confusions = build_phoneme_diagnostics(test_targets, test_predictions, vocab)
 

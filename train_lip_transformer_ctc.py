@@ -119,7 +119,7 @@ class VisualTransformerCTC(nn.Module):
         frame_features = self.frame_encoder(flat_frames)
         return frame_features.reshape(batch_size, time_steps, -1)
 
-    def forward(self, videos: torch.Tensor, video_lengths: torch.Tensor) -> torch.Tensor:
+    def forward(self, videos: torch.Tensor, video_lengths: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         sequence_features = self._encode_frames(videos)
         sequence_features = self.positional_encoding(sequence_features)
 
@@ -128,13 +128,13 @@ class VisualTransformerCTC(nn.Module):
         encoded_sequence = self.sequence_encoder(sequence_features, src_key_padding_mask=padding_mask)
         encoded_sequence = self.sequence_norm(encoded_sequence)
         logits = self.classifier(encoded_sequence)
-        return logits
+        return logits, video_lengths
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train a visual Transformer CTC model on lip crops and phoneme targets")
-    parser.add_argument("--video-dir", type=str, default="lip_crop_results_full")
-    parser.add_argument("--phoneme-csv", type=str, default="phoneme_results/phoneme_predictions.csv")
+    parser.add_argument("--video-dir", type=str, default="s1_lip_crops")
+    parser.add_argument("--phoneme-csv", type=str, default="phonemes_s1/phoneme_predictions.csv")
     parser.add_argument("--output-dir", type=str, default="visual_transformer_ctc_results")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=20)
@@ -160,6 +160,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use class-aware (weighted) sampling based on phoneme inverse frequency for training",
     )
+    parser.add_argument("--label-smoothing", type=float, default=0.0, help="Confidence penalty (entropy) coefficient to discourage over-confident predictions")
+    parser.add_argument("--beam-size", type=int, default=1, help="If >1, use CTC beam search decoding with this beam size during evaluation")
     return parser
 
 
@@ -277,9 +279,9 @@ def main() -> None:
         targets = batch["targets"].to(device)
         target_lengths = batch["target_lengths"].to(device)
         with torch.no_grad():
-            logits = model(videos, video_lengths)
+            logits, adjusted_lengths = model(videos, video_lengths)
             log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)
-            loss = criterion(log_probs, targets, video_lengths, target_lengths)
+            loss = criterion(log_probs, targets, adjusted_lengths, target_lengths)
         logger.info("Dry run videos shape: %s", tuple(videos.shape))
         logger.info("Dry run logits shape: %s", tuple(logits.shape))
         logger.info("Dry run CTC loss: %.6f", float(loss.item()))
@@ -296,8 +298,8 @@ def main() -> None:
             for param_group in optimizer.param_groups:
                 param_group["lr"] = current_lr
 
-        train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
-        val_metrics = validate(model, val_loader, criterion, device, id_to_token)
+        train_loss = train_epoch(model, train_loader, criterion, optimizer, device, label_smoothing=args.label_smoothing)
+        val_metrics = validate(model, val_loader, criterion, device, id_to_token, beam_size=args.beam_size)
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_metrics["loss"])
@@ -354,6 +356,7 @@ def main() -> None:
         criterion,
         device,
         id_to_token,
+        beam_size=args.beam_size,
     )
     matrix, _, per_phoneme_report, top_confusions = build_phoneme_diagnostics(test_targets, test_predictions, vocab)
 
