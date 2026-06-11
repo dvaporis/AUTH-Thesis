@@ -26,14 +26,15 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from train_lip_lstm_ctc import (
     DEFAULT_BLANK_TOKEN,
-    FrameEncoder,
+    Conv3DFrontEnd,
     LipPhonemeDataset,
     TrainingConfig,
     build_phoneme_diagnostics,
+    build_reduced_vocab,
     build_samples,
-    build_vocab,
     collate_batch,
     evaluate_loader_with_sequences,
+    remap_samples_to_reduced_vocab,
     save_confusion_matrix_csv,
     save_confusion_matrix_plot,
     split_samples,
@@ -93,9 +94,14 @@ class VisualTransformerCTC(nn.Module):
         finetune_backbone: bool = True,
     ):
         super().__init__()
-        self.frame_encoder = FrameEncoder(
+        # Conv3DFrontEnd replaces the per-frame FrameEncoder so that each
+        # position's features encode short-range motion context (temporal
+        # kernel size > 1, temporal stride = 1 throughout). The Transformer
+        # then attends over the full temporally-intact sequence for CTC.
+        # pretrained=False uses the lightweight custom 3D conv stack.
+        self.frontend = Conv3DFrontEnd(
             hidden_dim=hidden_dim,
-            pretrained=pretrained_backbone,
+            pretrained=False,
             finetune=finetune_backbone,
         )
 
@@ -114,10 +120,8 @@ class VisualTransformerCTC(nn.Module):
         self.classifier = nn.Linear(hidden_dim, vocab_size)
 
     def _encode_frames(self, videos: torch.Tensor) -> torch.Tensor:
-        batch_size, time_steps, channels, height, width = videos.shape
-        flat_frames = videos.reshape(batch_size * time_steps, channels, height, width)
-        frame_features = self.frame_encoder(flat_frames)
-        return frame_features.reshape(batch_size, time_steps, -1)
+        # Conv3DFrontEnd accepts (B, T, C, H, W) directly and returns (B, T, hidden_dim)
+        return self.frontend(videos)
 
     def forward(self, videos: torch.Tensor, video_lengths: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         sequence_features = self._encode_frames(videos)
@@ -145,13 +149,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--frame-stride", type=int, default=1)
     parser.add_argument("--transformer-layers", type=int, default=4)
     parser.add_argument("--transformer-heads", type=int, default=8)
-    parser.add_argument("--transformer-dropout", type=float, default=0.1)
+    parser.add_argument("--transformer-dropout", type=float, default=0.2)
     parser.add_argument("--transformer-feedforward-multiplier", type=int, default=4)
     parser.add_argument("--freeze-backbone", action="store_true")
     parser.add_argument("--no-pretrained", action="store_true")
-    parser.add_argument("--warmup-epochs", type=int, default=3, help="Linearly warm up the learning rate for this many epochs")
+    parser.add_argument("--warmup-epochs", type=int, default=5, help="Linearly warm up the learning rate for this many epochs")
     parser.add_argument("--lr-factor", type=float, default=0.5)
-    parser.add_argument("--lr-patience", type=int, default=2)
+    parser.add_argument("--lr-patience", type=int, default=5)
     parser.add_argument("--min-lr", type=float, default=1e-6)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dry-run", action="store_true")
@@ -160,8 +164,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use class-aware (weighted) sampling based on phoneme inverse frequency for training",
     )
-    parser.add_argument("--label-smoothing", type=float, default=0.0, help="Confidence penalty (entropy) coefficient to discourage over-confident predictions")
-    parser.add_argument("--beam-size", type=int, default=1, help="If >1, use CTC beam search decoding with this beam size during evaluation")
+    parser.add_argument("--label-smoothing", type=float, default=0.1, help="Blank penalty coefficient: adds mean blank log-prob to the CTC loss to counteract blank-dominance / deletion failures (0 to disable)")
+    parser.add_argument("--beam-size", type=int, default=5, help="If >1, use CTC beam search decoding with this beam size during evaluation")
+    parser.add_argument("--no-vocab-reduction", action="store_true", help="Disable automatic vocabulary reduction (merging and dropping rare phonemes)")
+    parser.add_argument("--vocab-min-count", type=int, default=10, help="Phonemes whose merged count in training data falls below this threshold are dropped from the vocabulary")
     return parser
 
 
@@ -190,12 +196,21 @@ def main() -> None:
         seed=args.seed,
     )
 
-    vocab = build_vocab(samples)
+    if not args.no_vocab_reduction:
+        vocab, merge_map = build_reduced_vocab(train_samples, min_count=args.vocab_min_count)
+        train_samples = remap_samples_to_reduced_vocab(train_samples, merge_map)
+        val_samples = remap_samples_to_reduced_vocab(val_samples, merge_map)
+        test_samples = remap_samples_to_reduced_vocab(test_samples, merge_map)
+    else:
+        from train_lip_lstm_ctc import build_vocab
+        vocab = build_vocab(samples)
+        merge_map = {t: t for t in vocab}
+
     id_to_token = {index + 1: token for index, token in enumerate(vocab)}
     id_to_token[0] = DEFAULT_BLANK_TOKEN
 
     with (output_dir / "phoneme_vocab.json").open("w", encoding="utf-8") as handle:
-        json.dump({"blank_id": 0, "blank_token": DEFAULT_BLANK_TOKEN, "tokens": vocab}, handle, ensure_ascii=False, indent=2)
+        json.dump({"blank_id": 0, "blank_token": DEFAULT_BLANK_TOKEN, "tokens": vocab, "merge_map": merge_map}, handle, ensure_ascii=False, indent=2)
 
     train_dataset = LipPhonemeDataset(
         train_samples,
