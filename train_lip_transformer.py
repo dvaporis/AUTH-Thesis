@@ -24,7 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
-from train_lip_lstm_ctc import (
+from train_lip_lstm import (
     DEFAULT_BLANK_TOKEN,
     Conv3DFrontEnd,
     LipPhonemeDataset,
@@ -202,7 +202,7 @@ def main() -> None:
         val_samples = remap_samples_to_reduced_vocab(val_samples, merge_map)
         test_samples = remap_samples_to_reduced_vocab(test_samples, merge_map)
     else:
-        from train_lip_lstm_ctc import build_vocab
+        from train_lip_lstm import build_vocab
         vocab = build_vocab(samples)
         merge_map = {t: t for t in vocab}
 

@@ -1,13 +1,15 @@
-"""Train a visual LSTM + CTC model on lip crops and wav2vec2 phoneme targets.
+"""Train a visual LSTM with frame-level phoneme supervision on aligned lip crops.
 
 The training pairs come from:
  - lip_crop_results_full: cropped lip videos
- - phoneme_results/phoneme_predictions.csv: phoneme strings per source clip
+ - phonemes_s1_aligned/phoneme_predictions.csv: frame-aligned phoneme labels
 
 Each video is treated as a variable-length frame sequence. A per-frame visual
 encoder extracts features, a bidirectional LSTM aggregates them through time,
-and a linear projection produces frame-wise phoneme logits. `nn.CTCLoss` is used
-to align the frame emissions with the phoneme target sequence.
+and a linear projection produces frame-wise phoneme logits. The training loss
+is a graph-aware frame cross entropy that uses the aligned labels directly and
+penalizes blank predictions more heavily than mistakes within a similarity
+cluster of related phonemes.
 
 Usage:
     python train_lip_lstm_ctc.py --dry-run
@@ -22,9 +24,9 @@ import json
 import logging
 import random
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Any
 
 import matplotlib
 import cv2
@@ -37,19 +39,33 @@ from torchvision import models
 from torchvision.transforms import v2
 from tqdm import tqdm
 
-
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-
 
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv"}
 DEFAULT_BLANK_TOKEN = "<blank>"
 MISSING_PREDICTION_TOKEN = "<missed>"
 INSERTION_TOKEN = "<inserted>"
+
+PHONEME_SIMILARITY_GROUPS = {
+    "bilabial_stop": {"p", "b", "m", "w"},
+    "labiodental_fricative": {"f", "v"},
+    "dental_fricative": {"θ", "ð"},
+    "alveolar_stop": {"t", "d"},
+    "alveolar_fricative": {"s", "z"},
+    "alveolar_nasal_liquid": {"n", "l", "ɹ", "r"},
+    "postalveolar": {"ʃ", "ʒ", "tʃ", "dʒ"},
+    "velar": {"k", "g", "ŋ"},
+    "glottal": {"h"},
+    "high_front_vowel": {"i", "ɪ", "e", "eɪ"},
+    "mid_front_vowel": {"ɛ", "æ"},
+    "central_vowel": {"ə", "ɐ", "ʌ", "ɜ", "ɚ"},
+    "back_vowel": {"u", "ʊ", "ɔ", "ɑ", "ɒ", "o", "oʊ"},
+    "low_vowel": {"a", "æ", "ɑ", "ɐ"},
+}
 
 
 @dataclass
@@ -70,12 +86,21 @@ class TrainingConfig:
 @dataclass
 class Sample:
     video_path: Path
-    target_tokens: List[str]
+    frame_tokens: List[str]
+    sentence: str = ""
+    canonical_tokens: List[str] = field(default_factory=list)
+
+
+@dataclass
+class AlignedPhonemeRecord:
+    sentence: str
+    canonical_tokens: List[str]
+    frame_tokens: List[str]
+    num_frames: int
 
 
 def find_lip_videos(data_dir: Path) -> List[Path]:
-    files = [path for path in sorted(data_dir.rglob("*")) if path.is_file() and path.suffix.lower() in VIDEO_EXTS]
-    return files
+    return [path for path in sorted(data_dir.rglob("*")) if path.is_file() and path.suffix.lower() in VIDEO_EXTS]
 
 
 def normalize_stem(path: Path) -> str:
@@ -85,26 +110,49 @@ def normalize_stem(path: Path) -> str:
     return stem
 
 
-def normalize_csv_file_field(file_field: str) -> str:
-    filename = file_field.replace("\\", "/").rsplit("/", 1)[-1]
-    return Path(filename).stem
+def normalize_frame_token(token: Optional[str]) -> str:
+    if token is None:
+        return DEFAULT_BLANK_TOKEN
+    normalized = str(token).strip()
+    if not normalized:
+        return DEFAULT_BLANK_TOKEN
+    return normalized
 
 
-def load_phoneme_targets(csv_path: Path) -> Dict[str, List[str]]:
+def load_aligned_phoneme_targets(csv_path: Path) -> Dict[str, AlignedPhonemeRecord]:
     if not csv_path.exists():
         raise FileNotFoundError(f"Phoneme CSV not found: {csv_path}")
 
-    targets: Dict[str, List[str]] = {}
+    targets: Dict[str, AlignedPhonemeRecord] = {}
     with csv_path.open("r", newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
-            file_field = row.get("file", "").strip()
-            phoneme_field = row.get("phonemes", "").strip()
-            if not file_field or not phoneme_field:
+            stem = row.get("stem", "").strip()
+            frame_labels_field = row.get("per_frame_labels", "").strip()
+            if not stem or not frame_labels_field:
                 continue
 
-            key = normalize_csv_file_field(file_field)
-            targets[key] = phoneme_field.split()
+            try:
+                raw_frame_labels = json.loads(frame_labels_field)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid per_frame_labels JSON for stem={stem}: {exc}") from exc
+
+            frame_tokens = [normalize_frame_token(token) for token in raw_frame_labels]
+            if not frame_tokens:
+                continue
+
+            canonical_field = row.get("canonical_phonemes", "").strip()
+            canonical_tokens = canonical_field.split() if canonical_field else []
+            sentence = row.get("sentence", "").strip()
+            num_frames_field = row.get("num_frames", "").strip()
+            num_frames = int(num_frames_field) if num_frames_field.isdigit() else len(frame_tokens)
+
+            targets[stem] = AlignedPhonemeRecord(
+                sentence=sentence,
+                canonical_tokens=canonical_tokens,
+                frame_tokens=frame_tokens,
+                num_frames=num_frames,
+            )
 
     if not targets:
         raise ValueError(f"No phoneme targets could be read from {csv_path}")
@@ -115,7 +163,7 @@ def load_phoneme_targets(csv_path: Path) -> Dict[str, List[str]]:
 def build_vocab(samples: Sequence[Sample]) -> List[str]:
     counter: Counter[str] = Counter()
     for sample in samples:
-        counter.update(sample.target_tokens)
+        counter.update(token for token in sample.frame_tokens if token != DEFAULT_BLANK_TOKEN)
     vocab = sorted(counter.keys())
     if not vocab:
         raise ValueError("Cannot build an empty phoneme vocabulary")
@@ -154,7 +202,6 @@ class LipPhonemeDataset(Dataset):
         self.train_transforms, self.val_transforms = self._build_transforms()
 
     def _build_transforms(self) -> Tuple[v2.Compose, v2.Compose]:
-        # ImageNet normalization (applies to channels in range [0, 1])
         imagenet_mean = [0.485, 0.456, 0.406]
         imagenet_std = [0.229, 0.224, 0.225]
 
@@ -181,45 +228,52 @@ class LipPhonemeDataset(Dataset):
             raise RuntimeError(f"Cannot open video file: {video_path}")
 
         frames: List[torch.Tensor] = []
-        frame_index = 0
         try:
             while True:
                 success, frame_bgr = capture.read()
                 if not success:
                     break
-                if frame_index % self.frame_stride != 0:
-                    frame_index += 1
-                    continue
-
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 frame_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).contiguous()
                 frames.append(frame_tensor)
-                frame_index += 1
         finally:
             capture.release()
 
         if not frames:
             raise RuntimeError(f"No frames decoded from {video_path}")
 
-        video = torch.stack(frames, dim=0)  # [T, C, H, W]
-        # Apply spatial/image transforms first (resizing, flip, color jitter)
+        return torch.stack(frames, dim=0)  # [T, C, H, W]
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        sample = self.samples[index]
+        video = self._load_video(sample.video_path)
+        frame_tokens = list(sample.frame_tokens)
+
+        # Synchronize raw frames and labels before step down striding
+        matched_length = min(len(frame_tokens), video.shape[0])
+        video = video[:matched_length]
+        frame_tokens = frame_tokens[:matched_length]
+
+        # Apply stride cleanly across matching time dimensions
+        if self.frame_stride > 1:
+            video = video[::self.frame_stride]
+            frame_tokens = frame_tokens[::self.frame_stride]
+
+        if not frame_tokens:
+            raise RuntimeError(f"Empty frame target sequence for {sample.video_path}")
+
         if self.is_training:
             video = self.train_transforms(video)
-        else:
-            video = self.val_transforms(video)
-
-        # Additional lightweight augmentations applied per-video during training
-        if self.is_training:
-            # brightness jitter
+            # Extra batch-level frame variations
+            mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+            mean = torch.tensor(mean, dtype=torch.float32).view(1, 3, 1, 1)
+            std = torch.tensor(std, dtype=torch.float32).view(1, 3, 1, 1)
             b_factor = 1.0 + (random.random() * 0.2 - 0.1)
-            video = video * float(b_factor)
-
-            # contrast jitter
-            mean = video.mean(dim=(1, 2, 3), keepdim=True)
             c_factor = 1.0 + (random.random() * 0.2 - 0.1)
+            video = (video * std + mean) * float(b_factor)
             video = (video - mean) * float(c_factor) + mean
+            video = (video - mean) / std
 
-            # random erasing (simple rectangular mask)
             if random.random() < 0.2:
                 t, c, h, w = video.shape
                 rect_h = max(1, int(h * (0.08 + random.random() * 0.15)))
@@ -227,51 +281,149 @@ class LipPhonemeDataset(Dataset):
                 y = random.randint(0, max(0, h - rect_h))
                 x = random.randint(0, max(0, w - rect_w))
                 video[:, :, y : y + rect_h, x : x + rect_w] = 0.0
-        return video
+        else:
+            video = self.val_transforms(video)
 
-    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
-        sample = self.samples[index]
-        video = self._load_video(sample.video_path)
-        target_ids = [self.token_to_id[token] for token in sample.target_tokens if token in self.token_to_id]
-
-        if not target_ids:
-            raise RuntimeError(f"Empty target sequence for {sample.video_path}")
+        target_ids = [self.blank_id if token == DEFAULT_BLANK_TOKEN else self.token_to_id[token] for token in frame_tokens]
 
         return {
             "video": video,
             "video_length": torch.tensor(video.shape[0], dtype=torch.long),
-            "targets": torch.tensor(target_ids, dtype=torch.long),
-            "target_length": torch.tensor(len(target_ids), dtype=torch.long),
+            "frame_targets": torch.tensor(target_ids, dtype=torch.long),
             "stem": sample.video_path.stem,
         }
 
 
-def collate_batch(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor | List[str]]:
+def collate_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     batch_size = len(batch)
     video_lengths = torch.tensor([int(item["video_length"]) for item in batch], dtype=torch.long)
-    target_lengths = torch.tensor([int(item["target_length"]) for item in batch], dtype=torch.long)
-
     max_frames = int(video_lengths.max().item())
+
     channels, height, width = batch[0]["video"].shape[1:]
     videos = torch.zeros(batch_size, max_frames, channels, height, width, dtype=batch[0]["video"].dtype)
+    frame_targets = torch.zeros(batch_size, max_frames, dtype=torch.long)  # Padded with blank_id (0)
 
-    targets: List[torch.Tensor] = []
     stems: List[str] = []
     for index, item in enumerate(batch):
-        video = item["video"]
-        videos[index, : video.shape[0]] = video
-        targets.append(item["targets"])
+        v = item["video"]
+        t = item["frame_targets"]
+        videos[index, : v.shape[0]] = v
+        frame_targets[index, : t.shape[0]] = t
         stems.append(str(item["stem"]))
-
-    flat_targets = torch.cat(targets, dim=0)
 
     return {
         "videos": videos,
         "video_lengths": video_lengths,
-        "targets": flat_targets,
-        "target_lengths": target_lengths,
+        "frame_targets": frame_targets,
         "stems": stems,
     }
+
+
+def collapse_frame_ids(frame_ids: Sequence[int], id_to_token: Dict[int, str], blank_id: int = 0) -> List[str]:
+    collapsed: List[str] = []
+    previous_token: Optional[str] = None
+    for token_id in frame_ids:
+        if token_id == blank_id:
+            previous_token = None
+            continue
+
+        token = id_to_token.get(int(token_id))
+        if token is None or token == DEFAULT_BLANK_TOKEN:
+            previous_token = None
+            continue
+
+        if token == previous_token:
+            continue
+
+        collapsed.append(token)
+        previous_token = token
+    return collapsed
+
+
+def frame_ids_to_text(frame_ids: Sequence[int], id_to_token: Dict[int, str], blank_id: int = 0) -> str:
+    return " ".join(collapse_frame_ids(frame_ids, id_to_token, blank_id=blank_id)).strip()
+
+
+def phoneme_similarity_score(left: str, right: str) -> float:
+    if left == right:
+        return 1.0
+    if left == DEFAULT_BLANK_TOKEN or right == DEFAULT_BLANK_TOKEN:
+        return 0.0
+
+    shared_groups = [group_name for group_name, group_tokens in PHONEME_SIMILARITY_GROUPS.items() if left in group_tokens and right in group_tokens]
+    if shared_groups:
+        if any(group_name.endswith("_vowel") for group_name in shared_groups):
+            return 0.75
+        if len(shared_groups) >= 2:
+            return 0.85
+        return 0.65
+
+    left_is_vowel = any(left in group_tokens for group_name, group_tokens in PHONEME_SIMILARITY_GROUPS.items() if group_name.endswith("_vowel"))
+    right_is_vowel = any(right in group_tokens for group_name, group_tokens in PHONEME_SIMILARITY_GROUPS.items() if group_name.endswith("_vowel"))
+    if left_is_vowel and right_is_vowel:
+        return 0.2
+
+    left_is_consonant = not left_is_vowel
+    right_is_consonant = not right_is_vowel
+    if left_is_consonant and right_is_consonant:
+        return 0.15
+
+    return 0.0
+
+
+def build_similarity_distribution(vocab: Sequence[str]) -> torch.Tensor:
+    labels = [DEFAULT_BLANK_TOKEN, *list(vocab)]
+    label_count = len(labels)
+    similarity_matrix = torch.zeros(label_count, label_count, dtype=torch.float32)
+
+    for left_index, left_label in enumerate(labels):
+        for right_index, right_label in enumerate(labels):
+            score = phoneme_similarity_score(left_label, right_label)
+            similarity_matrix[left_index, right_index] = float(score)
+
+    distribution = torch.zeros_like(similarity_matrix)
+    for label_index, label in enumerate(labels):
+        if label == DEFAULT_BLANK_TOKEN:
+            distribution[label_index, label_index] = 1.0
+            continue
+
+        neighbor_scores = similarity_matrix[label_index].clone()
+        neighbor_scores[0] = 0.0
+        neighbor_scores[label_index] = 0.0
+        neighbor_total = float(neighbor_scores.sum().item())
+
+        distribution[label_index, label_index] = 1.0
+        if neighbor_total > 0.0:
+            distribution[label_index] = 0.85 * distribution[label_index]
+            distribution[label_index] = distribution[label_index] + 0.15 * (neighbor_scores / neighbor_total)
+
+    return distribution
+
+
+class GraphAwareFrameCrossEntropyLoss(nn.Module):
+    def __init__(self, vocab: Sequence[str], blank_id: int = 0, blank_penalty: float = 0.5):
+        super().__init__()
+        self.blank_id = int(blank_id)
+        self.blank_penalty = float(blank_penalty)
+        self.register_buffer("target_distributions", build_similarity_distribution(vocab))
+
+    def forward(self, logits: torch.Tensor, frame_targets: torch.Tensor, frame_lengths: torch.Tensor) -> torch.Tensor:
+        log_probs = F.log_softmax(logits, dim=-1)
+        max_length = log_probs.shape[1]
+        valid_mask = torch.arange(max_length, device=frame_lengths.device).unsqueeze(0) < frame_lengths.unsqueeze(1)
+
+        flat_log_probs = log_probs[valid_mask]
+        flat_targets = frame_targets[valid_mask].clamp(min=0, max=self.target_distributions.shape[0] - 1)
+        target_distributions = self.target_distributions.to(logits.device)[flat_targets]
+
+        loss = -(target_distributions * flat_log_probs).sum(dim=-1)
+
+        if self.blank_penalty > 0.0:
+            blank_prob = flat_log_probs.exp()[:, self.blank_id]
+            nonblank_mask = flat_targets != self.blank_id
+            loss = loss + self.blank_penalty * blank_prob * nonblank_mask.float()
+
+        return loss.mean()
 
 
 class FrameEncoder(nn.Module):
@@ -296,7 +448,7 @@ class FrameEncoder(nn.Module):
         return self.projector(features)
 
 
-class VisualLSTMCTC(nn.Module):
+class VisualLSTMFrameCE(nn.Module):
     def __init__(self, vocab_size: int, hidden_dim: int = 256, lstm_layers: int = 2, pretrained_backbone: bool = True, finetune_backbone: bool = True):
         super().__init__()
         self.frame_encoder = FrameEncoder(hidden_dim=hidden_dim, pretrained=pretrained_backbone, finetune=finetune_backbone)
@@ -326,32 +478,12 @@ class VisualLSTMCTC(nn.Module):
 
 def decode_greedy(logits: torch.Tensor, blank_id: int = 0) -> List[int]:
     predicted = torch.argmax(logits, dim=-1).tolist()
-    collapsed: List[int] = []
-    previous_id: Optional[int] = None
-    for token_id in predicted:
-        if token_id == blank_id:
-            previous_id = token_id
-            continue
-        if previous_id == token_id:
-            continue
-        collapsed.append(int(token_id))
-        previous_id = token_id
-    return collapsed
+    return predicted
 
 
 def tokens_to_text(token_ids: List[int], id_to_token: Dict[int, str], blank_id: int = 0) -> str:
     tokens = [id_to_token[token_id] for token_id in token_ids if token_id != blank_id and token_id in id_to_token]
     return " ".join(tokens).strip()
-
-
-def split_target_and_lengths(targets: torch.Tensor, target_lengths: torch.Tensor) -> List[torch.Tensor]:
-    chunks: List[torch.Tensor] = []
-    offset = 0
-    for length in target_lengths.tolist():
-        next_offset = offset + int(length)
-        chunks.append(targets[offset:next_offset])
-        offset = next_offset
-    return chunks
 
 
 def align_token_sequences(reference: Sequence[str], hypothesis: Sequence[str]) -> List[Tuple[Optional[str], Optional[str]]]:
@@ -405,32 +537,32 @@ def align_token_sequences(reference: Sequence[str], hypothesis: Sequence[str]) -
 
 
 @torch.no_grad()
-def evaluate_batch(model: VisualLSTMCTC, batch: Dict[str, torch.Tensor | List[str]], criterion: nn.CTCLoss, device: torch.device, id_to_token: Dict[int, str]) -> Tuple[float, List[str], List[str]]:
+def evaluate_batch(model: VisualLSTMFrameCE, batch: Dict[str, Any], criterion: GraphAwareFrameCrossEntropyLoss, device: torch.device, id_to_token: Dict[int, str]) -> Tuple[float, List[str], List[str]]:
     videos = batch["videos"].to(device)
     video_lengths = batch["video_lengths"].to(device)
-    targets = batch["targets"].to(device)
-    target_lengths = batch["target_lengths"].to(device)
+    frame_targets = batch["frame_targets"].to(device)
 
     logits = model(videos, video_lengths)
-    log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)
-    loss = criterion(log_probs, targets, video_lengths, target_lengths)
+    loss = criterion(logits, frame_targets, video_lengths)
 
-    target_chunks = split_target_and_lengths(targets.cpu(), target_lengths.cpu())
     predicted_texts: List[str] = []
     target_texts: List[str] = []
     for item_index in range(logits.shape[0]):
-        pred_ids = decode_greedy(logits[item_index, : int(video_lengths[item_index])].cpu(), blank_id=0)
+        length = int(video_lengths[item_index].item())
+        pred_ids = decode_greedy(logits[item_index, :length].cpu(), blank_id=0)
+        target_ids = frame_targets[item_index, :length].cpu().tolist()
+        
         predicted_texts.append(tokens_to_text(pred_ids, id_to_token))
-        target_texts.append(tokens_to_text(target_chunks[item_index].tolist(), id_to_token))
+        target_texts.append(tokens_to_text(target_ids, id_to_token))
 
     return float(loss.item()), predicted_texts, target_texts
 
 
 @torch.no_grad()
 def evaluate_loader_with_sequences(
-    model: VisualLSTMCTC,
+    model: VisualLSTMFrameCE,
     loader: DataLoader,
-    criterion: nn.CTCLoss,
+    criterion: GraphAwareFrameCrossEntropyLoss,
     device: torch.device,
     id_to_token: Dict[int, str],
 ) -> Tuple[Dict[str, float], List[str], List[str]]:
@@ -462,7 +594,7 @@ def evaluate_loader_with_sequences(
     return metrics, all_predictions, all_targets
 
 
-def train_epoch(model: VisualLSTMCTC, loader: DataLoader, criterion: nn.CTCLoss, optimizer: torch.optim.Optimizer, device: torch.device) -> float:
+def train_epoch(model: VisualLSTMFrameCE, loader: DataLoader, criterion: GraphAwareFrameCrossEntropyLoss, optimizer: torch.optim.Optimizer, device: torch.device) -> float:
     model.train()
     total_loss = 0.0
     num_batches = 0
@@ -470,12 +602,10 @@ def train_epoch(model: VisualLSTMCTC, loader: DataLoader, criterion: nn.CTCLoss,
     for batch in tqdm(loader, desc="Train", leave=False):
         videos = batch["videos"].to(device)
         video_lengths = batch["video_lengths"].to(device)
-        targets = batch["targets"].to(device)
-        target_lengths = batch["target_lengths"].to(device)
+        frame_targets = batch["frame_targets"].to(device)
 
         logits = model(videos, video_lengths)
-        log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)
-        loss = criterion(log_probs, targets, video_lengths, target_lengths)
+        loss = criterion(logits, frame_targets, video_lengths)
 
         if not torch.isfinite(loss):
             logger.warning("Skipping non-finite loss batch")
@@ -493,7 +623,7 @@ def train_epoch(model: VisualLSTMCTC, loader: DataLoader, criterion: nn.CTCLoss,
 
 
 @torch.no_grad()
-def validate(model: VisualLSTMCTC, loader: DataLoader, criterion: nn.CTCLoss, device: torch.device, id_to_token: Dict[int, str]) -> Dict[str, float]:
+def validate(model: VisualLSTMFrameCE, loader: DataLoader, criterion: GraphAwareFrameCrossEntropyLoss, device: torch.device, id_to_token: Dict[int, str]) -> Dict[str, float]:
     model.eval()
     total_loss = 0.0
     num_batches = 0
@@ -539,7 +669,7 @@ def build_phoneme_diagnostics(
     target_texts: Sequence[str],
     predicted_texts: Sequence[str],
     labels: Sequence[str],
-) -> Tuple[np.ndarray, Dict[str, Dict[str, float]], List[Dict[str, object]], List[Dict[str, object]]]:
+) -> Tuple[np.ndarray, Dict[str, Dict[str, float]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     label_list = list(labels)
     label_to_index = {label: index for index, label in enumerate(label_list)}
     matrix = np.zeros((len(label_list) + 1, len(label_list) + 1), dtype=np.int64)
@@ -588,7 +718,7 @@ def build_phoneme_diagnostics(
             else:
                 top_confusions[(actual_token, predicted_token)] += 1
 
-    per_phoneme_report: List[Dict[str, object]] = []
+    per_phoneme_report: List[Dict[str, Any]] = []
     for label in label_list:
         support = int(stats[label]["support"])
         predicted = int(stats[label]["predicted"])
@@ -657,15 +787,20 @@ def save_confusion_matrix_plot(matrix: np.ndarray, labels: Sequence[str], output
 
 
 def build_samples(video_dir: Path, phoneme_csv: Path) -> List[Sample]:
-    targets = load_phoneme_targets(phoneme_csv)
+    targets = load_aligned_phoneme_targets(phoneme_csv)
     samples: List[Sample] = []
 
     for video_path in find_lip_videos(video_dir):
         key = normalize_stem(video_path)
-        target_tokens = targets.get(key)
-        if not target_tokens:
+        record = targets.get(key)
+        if not record:
             continue
-        samples.append(Sample(video_path=video_path, target_tokens=target_tokens))
+        samples.append(Sample(
+            video_path=video_path, 
+            frame_tokens=record.frame_tokens,
+            sentence=record.sentence,
+            canonical_tokens=record.canonical_tokens
+        ))
 
     if not samples:
         raise FileNotFoundError(
@@ -676,10 +811,10 @@ def build_samples(video_dir: Path, phoneme_csv: Path) -> List[Sample]:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train a visual LSTM CTC model on lip crops and phoneme targets")
+    parser = argparse.ArgumentParser(description="Train a visual LSTM Frame CE model on lip crops and frame phoneme targets")
     parser.add_argument("--video-dir", type=str, default="s1_lip_crops")
-    parser.add_argument("--phoneme-csv", type=str, default="phonemes_s1/phoneme_predictions.csv")
-    parser.add_argument("--output-dir", type=str, default="visual_lstm_ctc_results")
+    parser.add_argument("--phoneme-csv", type=str, default="phonemes_s1_aligned/phoneme_predictions.csv")
+    parser.add_argument("--output-dir", type=str, default="visual_lstm_ce_results")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -695,7 +830,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-lr", type=float, default=1e-6)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--class-aware-sampling", action="store_true", help="Use class-aware (weighted) sampling based on phoneme inverse frequency for training")
+    parser.add_argument("--class-aware-sampling", action="store_true", help="Use class-aware sampling based on inverse token frequency")
     return parser
 
 
@@ -735,16 +870,15 @@ def main() -> None:
     val_dataset = LipPhonemeDataset(val_samples, vocab=vocab, frame_size=args.frame_size, frame_stride=args.frame_stride, augment=False)
     test_dataset = LipPhonemeDataset(test_samples, vocab=vocab, frame_size=args.frame_size, frame_stride=args.frame_stride, augment=False)
 
-    # Optionally use class-aware sampling based on inverse phoneme frequency
     if args.class_aware_sampling:
         phoneme_counts: Counter = Counter()
         for s in train_samples:
-            phoneme_counts.update(s.target_tokens)
+            phoneme_counts.update(s.frame_tokens)
 
         inv_freq = {token: 1.0 / max(1, count) for token, count in phoneme_counts.items()}
         sample_weights: List[float] = []
         for s in train_samples:
-            toks = [t for t in s.target_tokens if t in inv_freq]
+            toks = [t for t in s.frame_tokens if t in inv_freq]
             if toks:
                 w = float(sum(inv_freq[t] for t in toks) / len(toks))
             else:
@@ -755,10 +889,11 @@ def main() -> None:
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=sampler, num_workers=4, collate_fn=collate_batch)
     else:
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=collate_batch)
+        
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=collate_batch)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=collate_batch)
 
-    model = VisualLSTMCTC(
+    model = VisualLSTMFrameCE(
         vocab_size=len(vocab) + 1,
         hidden_dim=args.hidden_dim,
         lstm_layers=args.lstm_layers,
@@ -766,7 +901,7 @@ def main() -> None:
         finetune_backbone=not args.freeze_backbone,
     ).to(device)
 
-    criterion = nn.CTCLoss(blank=0, zero_infinity=True)
+    criterion = GraphAwareFrameCrossEntropyLoss(vocab=vocab, blank_id=0, blank_penalty=0.5)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
@@ -784,15 +919,13 @@ def main() -> None:
         batch = next(iter(train_loader))
         videos = batch["videos"].to(device)
         video_lengths = batch["video_lengths"].to(device)
-        targets = batch["targets"].to(device)
-        target_lengths = batch["target_lengths"].to(device)
+        frame_targets = batch["frame_targets"].to(device)
         with torch.no_grad():
             logits = model(videos, video_lengths)
-            log_probs = F.log_softmax(logits, dim=-1).transpose(0, 1)
-            loss = criterion(log_probs, targets, video_lengths, target_lengths)
+            loss = criterion(logits, frame_targets, video_lengths)
         logger.info("Dry run videos shape: %s", tuple(videos.shape))
         logger.info("Dry run logits shape: %s", tuple(logits.shape))
-        logger.info("Dry run CTC loss: %.6f", float(loss.item()))
+        logger.info("Dry run Frame Graph CE loss: %.6f", float(loss.item()))
         return
 
     best_val_loss = float("inf")
