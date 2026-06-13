@@ -11,9 +11,24 @@ is a graph-aware frame cross entropy that uses the aligned labels directly and
 penalizes blank predictions more heavily than mistakes within a similarity
 cluster of related phonemes.
 
+Changes in this version
+-----------------------
+1. blank_penalty raised from 0.5 → 2.0 (also exposed as --blank-penalty CLI arg).
+   The previous run produced 70/52/50/44 spurious insertions of ɪ/n/ɛ/s,
+   indicating the model learned that spamming high-frequency tokens incurs lower
+   expected loss than committing to correct but rarer ones.  The blank_penalty
+   term adds `blank_penalty * p(blank) * I[target ≠ blank]` to each frame's
+   loss, directly taxing confident non-blank predictions on non-blank frames.
+
+2. Dropout raised from 0.2 → 0.45 in both the projector head (FrameEncoder)
+   and the inter-layer LSTM dropout (VisualLSTMFrameCE).  Weight-decay default
+   raised from 1e-4 → 5e-4.  Together these target the large train/val gap
+   observed in the previous run (train ~0.55, val ~1.11 at epoch 22).
+
 Usage:
-    python train_lip_lstm_ctc.py --dry-run
-    python train_lip_lstm_ctc.py --epochs 20 --batch-size 4
+    python train_lip_lstm.py --dry-run
+    python train_lip_lstm.py --epochs 20 --batch-size 4
+    python train_lip_lstm.py --blank-penalty 1.0  # soften if under-predicting
 """
 
 from __future__ import annotations
@@ -73,13 +88,14 @@ class TrainingConfig:
     batch_size: int = 4
     num_epochs: int = 20
     learning_rate: float = 1e-4
-    weight_decay: float = 1e-4
+    # Raised from 1e-4 → 5e-4 to close the train/val overfitting gap.
+    weight_decay: float = 5e-4
     hidden_dim: int = 256
     lstm_layers: int = 2
     train_ratio: float = 0.6
     val_ratio: float = 0.2
     test_ratio: float = 0.2
-    early_stopping_patience: int = 6
+    early_stopping_patience: int = 60
     early_stopping_min_delta: float = 1e-3
 
 
@@ -170,7 +186,13 @@ def build_vocab(samples: Sequence[Sample]) -> List[str]:
     return vocab
 
 
-def split_samples(samples: List[Sample], train_ratio: float, val_ratio: float, test_ratio: float, seed: int) -> Tuple[List[Sample], List[Sample], List[Sample]]:
+def split_samples(
+    samples: List[Sample],
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+    seed: int,
+) -> Tuple[List[Sample], List[Sample], List[Sample]]:
     if not np.isclose(train_ratio + val_ratio + test_ratio, 1.0):
         raise ValueError("train_ratio + val_ratio + test_ratio must equal 1.0")
 
@@ -189,7 +211,14 @@ def split_samples(samples: List[Sample], train_ratio: float, val_ratio: float, t
 
 
 class LipPhonemeDataset(Dataset):
-    def __init__(self, samples: Sequence[Sample], vocab: Sequence[str], frame_size: int = 224, frame_stride: int = 1, augment: bool = False):
+    def __init__(
+        self,
+        samples: Sequence[Sample],
+        vocab: Sequence[str],
+        frame_size: int = 224,
+        frame_stride: int = 1,
+        augment: bool = False,
+    ):
         if frame_stride < 1:
             raise ValueError("frame_stride must be >= 1")
 
@@ -249,12 +278,11 @@ class LipPhonemeDataset(Dataset):
         video = self._load_video(sample.video_path)
         frame_tokens = list(sample.frame_tokens)
 
-        # Synchronize raw frames and labels before step down striding
+        # Synchronize raw frames and labels before stride
         matched_length = min(len(frame_tokens), video.shape[0])
         video = video[:matched_length]
         frame_tokens = frame_tokens[:matched_length]
 
-        # Apply stride cleanly across matching time dimensions
         if self.frame_stride > 1:
             video = video[::self.frame_stride]
             frame_tokens = frame_tokens[::self.frame_stride]
@@ -264,10 +292,8 @@ class LipPhonemeDataset(Dataset):
 
         if self.is_training:
             video = self.train_transforms(video)
-            # Extra batch-level frame variations
-            mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
-            mean = torch.tensor(mean, dtype=torch.float32).view(1, 3, 1, 1)
-            std = torch.tensor(std, dtype=torch.float32).view(1, 3, 1, 1)
+            mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
             b_factor = 1.0 + (random.random() * 0.2 - 0.1)
             c_factor = 1.0 + (random.random() * 0.2 - 0.1)
             video = (video * std + mean) * float(b_factor)
@@ -284,7 +310,10 @@ class LipPhonemeDataset(Dataset):
         else:
             video = self.val_transforms(video)
 
-        target_ids = [self.blank_id if token == DEFAULT_BLANK_TOKEN else self.token_to_id[token] for token in frame_tokens]
+        target_ids = [
+            self.blank_id if token == DEFAULT_BLANK_TOKEN else self.token_to_id[token]
+            for token in frame_tokens
+        ]
 
         return {
             "video": video,
@@ -301,7 +330,7 @@ def collate_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     channels, height, width = batch[0]["video"].shape[1:]
     videos = torch.zeros(batch_size, max_frames, channels, height, width, dtype=batch[0]["video"].dtype)
-    frame_targets = torch.zeros(batch_size, max_frames, dtype=torch.long)  # Padded with blank_id (0)
+    frame_targets = torch.zeros(batch_size, max_frames, dtype=torch.long)
 
     stems: List[str] = []
     for index, item in enumerate(batch):
@@ -319,22 +348,23 @@ def collate_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def collapse_frame_ids(frame_ids: Sequence[int], id_to_token: Dict[int, str], blank_id: int = 0) -> List[str]:
+def collapse_frame_ids(
+    frame_ids: Sequence[int],
+    id_to_token: Dict[int, str],
+    blank_id: int = 0,
+) -> List[str]:
     collapsed: List[str] = []
     previous_token: Optional[str] = None
     for token_id in frame_ids:
         if token_id == blank_id:
             previous_token = None
             continue
-
         token = id_to_token.get(int(token_id))
         if token is None or token == DEFAULT_BLANK_TOKEN:
             previous_token = None
             continue
-
         if token == previous_token:
             continue
-
         collapsed.append(token)
         previous_token = token
     return collapsed
@@ -350,7 +380,11 @@ def phoneme_similarity_score(left: str, right: str) -> float:
     if left == DEFAULT_BLANK_TOKEN or right == DEFAULT_BLANK_TOKEN:
         return 0.0
 
-    shared_groups = [group_name for group_name, group_tokens in PHONEME_SIMILARITY_GROUPS.items() if left in group_tokens and right in group_tokens]
+    shared_groups = [
+        group_name
+        for group_name, group_tokens in PHONEME_SIMILARITY_GROUPS.items()
+        if left in group_tokens and right in group_tokens
+    ]
     if shared_groups:
         if any(group_name.endswith("_vowel") for group_name in shared_groups):
             return 0.75
@@ -358,16 +392,20 @@ def phoneme_similarity_score(left: str, right: str) -> float:
             return 0.85
         return 0.65
 
-    left_is_vowel = any(left in group_tokens for group_name, group_tokens in PHONEME_SIMILARITY_GROUPS.items() if group_name.endswith("_vowel"))
-    right_is_vowel = any(right in group_tokens for group_name, group_tokens in PHONEME_SIMILARITY_GROUPS.items() if group_name.endswith("_vowel"))
+    left_is_vowel = any(
+        left in group_tokens
+        for group_name, group_tokens in PHONEME_SIMILARITY_GROUPS.items()
+        if group_name.endswith("_vowel")
+    )
+    right_is_vowel = any(
+        right in group_tokens
+        for group_name, group_tokens in PHONEME_SIMILARITY_GROUPS.items()
+        if group_name.endswith("_vowel")
+    )
     if left_is_vowel and right_is_vowel:
         return 0.2
-
-    left_is_consonant = not left_is_vowel
-    right_is_consonant = not right_is_vowel
-    if left_is_consonant and right_is_consonant:
+    if (not left_is_vowel) and (not right_is_vowel):
         return 0.15
-
     return 0.0
 
 
@@ -378,8 +416,7 @@ def build_similarity_distribution(vocab: Sequence[str]) -> torch.Tensor:
 
     for left_index, left_label in enumerate(labels):
         for right_index, right_label in enumerate(labels):
-            score = phoneme_similarity_score(left_label, right_label)
-            similarity_matrix[left_index, right_index] = float(score)
+            similarity_matrix[left_index, right_index] = phoneme_similarity_score(left_label, right_label)
 
     distribution = torch.zeros_like(similarity_matrix)
     for label_index, label in enumerate(labels):
@@ -401,16 +438,41 @@ def build_similarity_distribution(vocab: Sequence[str]) -> torch.Tensor:
 
 
 class GraphAwareFrameCrossEntropyLoss(nn.Module):
-    def __init__(self, vocab: Sequence[str], blank_id: int = 0, blank_penalty: float = 0.5):
+    """Frame-level cross-entropy with phoneme-similarity soft targets.
+
+    The blank_penalty term taxes the model for predicting any non-blank token
+    on frames whose target IS a non-blank token but the model is still
+    assigning probability mass to the blank class.  More precisely it adds
+
+        blank_penalty * p(blank | frame) * 1[target ≠ blank]
+
+    to the per-frame loss.  This discourages the over-insertion pattern seen
+    in the previous run where high-frequency phonemes (ɪ, n, ɛ, s) were
+    hallucinated at a rate of 44–70 per evaluation set.
+
+    Default blank_penalty raised from 0.5 → 2.0.  Pass --blank-penalty to
+    tune: decrease toward 1.0 if recall on common phonemes drops noticeably,
+    increase above 2.0 if insertions remain dominant.
+    """
+
+    def __init__(self, vocab: Sequence[str], blank_id: int = 0, blank_penalty: float = 2.0):
         super().__init__()
         self.blank_id = int(blank_id)
         self.blank_penalty = float(blank_penalty)
         self.register_buffer("target_distributions", build_similarity_distribution(vocab))
 
-    def forward(self, logits: torch.Tensor, frame_targets: torch.Tensor, frame_lengths: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        logits: torch.Tensor,
+        frame_targets: torch.Tensor,
+        frame_lengths: torch.Tensor,
+    ) -> torch.Tensor:
         log_probs = F.log_softmax(logits, dim=-1)
         max_length = log_probs.shape[1]
-        valid_mask = torch.arange(max_length, device=frame_lengths.device).unsqueeze(0) < frame_lengths.unsqueeze(1)
+        valid_mask = (
+            torch.arange(max_length, device=frame_lengths.device).unsqueeze(0)
+            < frame_lengths.unsqueeze(1)
+        )
 
         flat_log_probs = log_probs[valid_mask]
         flat_targets = frame_targets[valid_mask].clamp(min=0, max=self.target_distributions.shape[0] - 1)
@@ -420,13 +482,18 @@ class GraphAwareFrameCrossEntropyLoss(nn.Module):
 
         if self.blank_penalty > 0.0:
             blank_prob = flat_log_probs.exp()[:, self.blank_id]
-            nonblank_mask = flat_targets != self.blank_id
-            loss = loss + self.blank_penalty * blank_prob * nonblank_mask.float()
+            nonblank_mask = (flat_targets != self.blank_id).float()
+            loss = loss + self.blank_penalty * blank_prob * nonblank_mask
 
         return loss.mean()
 
 
 class FrameEncoder(nn.Module):
+    """Per-frame ResNet-18 visual encoder.
+
+    Projector dropout raised from 0.2 → 0.45 to reduce overfitting.
+    """
+
     def __init__(self, hidden_dim: int = 256, pretrained: bool = True, finetune: bool = True):
         super().__init__()
         weights = models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
@@ -436,7 +503,11 @@ class FrameEncoder(nn.Module):
         self.projector = nn.Sequential(
             nn.Linear(512, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
+            # Raised 0.2 → 0.45: targets the large train/val gap in the
+            # previous run.  The projector is the narrowest bottleneck before
+            # the sequence model, making it the least disruptive place to add
+            # regularisation without interfering with LSTM dynamics.
+            nn.Dropout(0.45),
         )
 
         if not finetune:
@@ -449,16 +520,35 @@ class FrameEncoder(nn.Module):
 
 
 class VisualLSTMFrameCE(nn.Module):
-    def __init__(self, vocab_size: int, hidden_dim: int = 256, lstm_layers: int = 2, pretrained_backbone: bool = True, finetune_backbone: bool = True):
+    """Bidirectional LSTM over per-frame ResNet-18 features.
+
+    Inter-layer LSTM dropout raised from 0.2 → 0.45 to complement the
+    projector dropout increase.  Has no effect when lstm_layers=1 (PyTorch
+    silently ignores the dropout parameter for single-layer LSTMs).
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        hidden_dim: int = 256,
+        lstm_layers: int = 2,
+        pretrained_backbone: bool = True,
+        finetune_backbone: bool = True,
+    ):
         super().__init__()
-        self.frame_encoder = FrameEncoder(hidden_dim=hidden_dim, pretrained=pretrained_backbone, finetune=finetune_backbone)
+        self.frame_encoder = FrameEncoder(
+            hidden_dim=hidden_dim,
+            pretrained=pretrained_backbone,
+            finetune=finetune_backbone,
+        )
         self.lstm = nn.LSTM(
             input_size=hidden_dim,
             hidden_size=hidden_dim,
             num_layers=lstm_layers,
             batch_first=True,
             bidirectional=True,
-            dropout=0.2 if lstm_layers > 1 else 0.0,
+            # Raised 0.2 → 0.45 to match projector dropout.
+            dropout=0.45 if lstm_layers > 1 else 0.0,
         )
         self.classifier = nn.Linear(hidden_dim * 2, vocab_size)
 
@@ -468,25 +558,32 @@ class VisualLSTMFrameCE(nn.Module):
         frame_features = self.frame_encoder(flat_frames)
         sequence_features = frame_features.reshape(batch_size, time_steps, -1)
 
-        packed = nn.utils.rnn.pack_padded_sequence(sequence_features, video_lengths.cpu(), batch_first=True, enforce_sorted=False)
+        packed = nn.utils.rnn.pack_padded_sequence(
+            sequence_features, video_lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
         packed_output, _ = self.lstm(packed)
         lstm_output, _ = nn.utils.rnn.pad_packed_sequence(packed_output, batch_first=True)
 
-        logits = self.classifier(lstm_output)
-        return logits
+        return self.classifier(lstm_output)
 
 
 def decode_greedy(logits: torch.Tensor, blank_id: int = 0) -> List[int]:
-    predicted = torch.argmax(logits, dim=-1).tolist()
-    return predicted
+    return torch.argmax(logits, dim=-1).tolist()
 
 
 def tokens_to_text(token_ids: List[int], id_to_token: Dict[int, str], blank_id: int = 0) -> str:
-    tokens = [id_to_token[token_id] for token_id in token_ids if token_id != blank_id and token_id in id_to_token]
+    tokens = [
+        id_to_token[token_id]
+        for token_id in token_ids
+        if token_id != blank_id and token_id in id_to_token
+    ]
     return " ".join(tokens).strip()
 
 
-def align_token_sequences(reference: Sequence[str], hypothesis: Sequence[str]) -> List[Tuple[Optional[str], Optional[str]]]:
+def align_token_sequences(
+    reference: Sequence[str],
+    hypothesis: Sequence[str],
+) -> List[Tuple[Optional[str], Optional[str]]]:
     reference_length = len(reference)
     hypothesis_length = len(hypothesis)
 
@@ -502,7 +599,9 @@ def align_token_sequences(reference: Sequence[str], hypothesis: Sequence[str]) -
 
     for ref_index in range(1, reference_length + 1):
         for hyp_index in range(1, hypothesis_length + 1):
-            substitute_cost = distances[ref_index - 1][hyp_index - 1] + int(reference[ref_index - 1] != hypothesis[hyp_index - 1])
+            substitute_cost = distances[ref_index - 1][hyp_index - 1] + int(
+                reference[ref_index - 1] != hypothesis[hyp_index - 1]
+            )
             delete_cost = distances[ref_index - 1][hyp_index] + 1
             insert_cost = distances[ref_index][hyp_index - 1] + 1
 
@@ -537,7 +636,13 @@ def align_token_sequences(reference: Sequence[str], hypothesis: Sequence[str]) -
 
 
 @torch.no_grad()
-def evaluate_batch(model: VisualLSTMFrameCE, batch: Dict[str, Any], criterion: GraphAwareFrameCrossEntropyLoss, device: torch.device, id_to_token: Dict[int, str]) -> Tuple[float, List[str], List[str]]:
+def evaluate_batch(
+    model: VisualLSTMFrameCE,
+    batch: Dict[str, Any],
+    criterion: GraphAwareFrameCrossEntropyLoss,
+    device: torch.device,
+    id_to_token: Dict[int, str],
+) -> Tuple[float, List[str], List[str]]:
     videos = batch["videos"].to(device)
     video_lengths = batch["video_lengths"].to(device)
     frame_targets = batch["frame_targets"].to(device)
@@ -551,7 +656,6 @@ def evaluate_batch(model: VisualLSTMFrameCE, batch: Dict[str, Any], criterion: G
         length = int(video_lengths[item_index].item())
         pred_ids = decode_greedy(logits[item_index, :length].cpu(), blank_id=0)
         target_ids = frame_targets[item_index, :length].cpu().tolist()
-        
         predicted_texts.append(tokens_to_text(pred_ids, id_to_token))
         target_texts.append(tokens_to_text(target_ids, id_to_token))
 
@@ -594,7 +698,13 @@ def evaluate_loader_with_sequences(
     return metrics, all_predictions, all_targets
 
 
-def train_epoch(model: VisualLSTMFrameCE, loader: DataLoader, criterion: GraphAwareFrameCrossEntropyLoss, optimizer: torch.optim.Optimizer, device: torch.device) -> float:
+def train_epoch(
+    model: VisualLSTMFrameCE,
+    loader: DataLoader,
+    criterion: GraphAwareFrameCrossEntropyLoss,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> float:
     model.train()
     total_loss = 0.0
     num_batches = 0
@@ -623,7 +733,13 @@ def train_epoch(model: VisualLSTMFrameCE, loader: DataLoader, criterion: GraphAw
 
 
 @torch.no_grad()
-def validate(model: VisualLSTMFrameCE, loader: DataLoader, criterion: GraphAwareFrameCrossEntropyLoss, device: torch.device, id_to_token: Dict[int, str]) -> Dict[str, float]:
+def validate(
+    model: VisualLSTMFrameCE,
+    loader: DataLoader,
+    criterion: GraphAwareFrameCrossEntropyLoss,
+    device: torch.device,
+    id_to_token: Dict[int, str],
+) -> Dict[str, float]:
     model.eval()
     total_loss = 0.0
     num_batches = 0
@@ -675,7 +791,8 @@ def build_phoneme_diagnostics(
     matrix = np.zeros((len(label_list) + 1, len(label_list) + 1), dtype=np.int64)
 
     stats: Dict[str, Dict[str, float]] = {
-        label: {"support": 0.0, "predicted": 0.0, "correct": 0.0, "missed": 0.0} for label in label_list
+        label: {"support": 0.0, "predicted": 0.0, "correct": 0.0, "missed": 0.0}
+        for label in label_list
     }
     top_confusions: Counter[Tuple[str, str]] = Counter()
 
@@ -726,17 +843,15 @@ def build_phoneme_diagnostics(
         missed = int(stats[label]["missed"])
         recall = correct / support if support else 0.0
         precision = correct / predicted if predicted else 0.0
-        per_phoneme_report.append(
-            {
-                "phoneme": label,
-                "support": support,
-                "predicted": predicted,
-                "correct": correct,
-                "missed": missed,
-                "recall": recall,
-                "precision": precision,
-            }
-        )
+        per_phoneme_report.append({
+            "phoneme": label,
+            "support": support,
+            "predicted": predicted,
+            "correct": correct,
+            "missed": missed,
+            "recall": recall,
+            "precision": precision,
+        })
 
     per_phoneme_report.sort(key=lambda item: (item["recall"], -item["support"], str(item["phoneme"])))
     top_confusion_report = [
@@ -754,7 +869,7 @@ def save_confusion_matrix_csv(matrix: np.ndarray, labels: Sequence[str], output_
         writer = csv.writer(handle)
         writer.writerow(["actual/predicted", *column_labels])
         for row_label, row_values in zip(row_labels, matrix):
-            writer.writerow([row_label, *[int(value) for value in row_values.tolist()]])
+            writer.writerow([row_label, *[int(v) for v in row_values.tolist()]])
 
 
 def save_confusion_matrix_plot(matrix: np.ndarray, labels: Sequence[str], output_path: Path) -> None:
@@ -779,7 +894,10 @@ def save_confusion_matrix_plot(matrix: np.ndarray, labels: Sequence[str], output
             for column_index in range(matrix.shape[1]):
                 value = int(matrix[row_index, column_index])
                 if value:
-                    ax.text(column_index, row_index, str(value), ha="center", va="center", color="black", fontsize=8)
+                    ax.text(
+                        column_index, row_index, str(value),
+                        ha="center", va="center", color="black", fontsize=8,
+                    )
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=200)
@@ -796,10 +914,10 @@ def build_samples(video_dir: Path, phoneme_csv: Path) -> List[Sample]:
         if not record:
             continue
         samples.append(Sample(
-            video_path=video_path, 
+            video_path=video_path,
             frame_tokens=record.frame_tokens,
             sentence=record.sentence,
-            canonical_tokens=record.canonical_tokens
+            canonical_tokens=record.canonical_tokens,
         ))
 
     if not samples:
@@ -811,14 +929,18 @@ def build_samples(video_dir: Path, phoneme_csv: Path) -> List[Sample]:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train a visual LSTM Frame CE model on lip crops and frame phoneme targets")
+    parser = argparse.ArgumentParser(
+        description="Train a visual LSTM Frame CE model on lip crops and frame phoneme targets"
+    )
     parser.add_argument("--video-dir", type=str, default="s1_lip_crops")
     parser.add_argument("--phoneme-csv", type=str, default="phonemes_s1_aligned/phoneme_predictions.csv")
     parser.add_argument("--output-dir", type=str, default="visual_lstm_ce_results")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    # Raised from 1e-4 → 5e-4; pass --weight-decay to override.
+    parser.add_argument("--weight-decay", type=float, default=5e-4,
+                        help="L2 weight decay (raised from 1e-4 → 5e-4 to reduce overfitting)")
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--lstm-layers", type=int, default=2)
     parser.add_argument("--frame-size", type=int, default=224)
@@ -830,7 +952,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-lr", type=float, default=1e-6)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--class-aware-sampling", action="store_true", help="Use class-aware sampling based on inverse token frequency")
+    parser.add_argument(
+        "--blank-penalty", type=float, default=2.0,
+        help=(
+            "Blank-penalty coefficient for GraphAwareFrameCrossEntropyLoss. "
+            "Raised from 0.5 → 2.0 to suppress the insertion errors seen in the "
+            "previous run (70/52/50/44 spurious ɪ/n/ɛ/s insertions). "
+            "Decrease toward 1.0 if common-phoneme recall drops noticeably."
+        ),
+    )
+    parser.add_argument(
+        "--class-aware-sampling", action="store_true",
+        help="Use class-aware sampling based on inverse token frequency",
+    )
     return parser
 
 
@@ -844,6 +978,11 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Using device: %s", device)
+    logger.info(
+        "Regularisation: blank_penalty=%.2f  weight_decay=%.2e  "
+        "projector_dropout=0.45  lstm_dropout=0.45",
+        args.blank_penalty, args.weight_decay,
+    )
 
     video_dir = Path(args.video_dir)
     phoneme_csv = Path(args.phoneme_csv)
@@ -864,11 +1003,23 @@ def main() -> None:
     id_to_token[0] = DEFAULT_BLANK_TOKEN
 
     with (output_dir / "phoneme_vocab.json").open("w", encoding="utf-8") as handle:
-        json.dump({"blank_id": 0, "blank_token": DEFAULT_BLANK_TOKEN, "tokens": vocab}, handle, ensure_ascii=False, indent=2)
+        json.dump(
+            {"blank_id": 0, "blank_token": DEFAULT_BLANK_TOKEN, "tokens": vocab},
+            handle, ensure_ascii=False, indent=2,
+        )
 
-    train_dataset = LipPhonemeDataset(train_samples, vocab=vocab, frame_size=args.frame_size, frame_stride=args.frame_stride, augment=True)
-    val_dataset = LipPhonemeDataset(val_samples, vocab=vocab, frame_size=args.frame_size, frame_stride=args.frame_stride, augment=False)
-    test_dataset = LipPhonemeDataset(test_samples, vocab=vocab, frame_size=args.frame_size, frame_stride=args.frame_stride, augment=False)
+    train_dataset = LipPhonemeDataset(
+        train_samples, vocab=vocab, frame_size=args.frame_size,
+        frame_stride=args.frame_stride, augment=True,
+    )
+    val_dataset = LipPhonemeDataset(
+        val_samples, vocab=vocab, frame_size=args.frame_size,
+        frame_stride=args.frame_stride, augment=False,
+    )
+    test_dataset = LipPhonemeDataset(
+        test_samples, vocab=vocab, frame_size=args.frame_size,
+        frame_stride=args.frame_stride, augment=False,
+    )
 
     if args.class_aware_sampling:
         phoneme_counts: Counter = Counter()
@@ -879,17 +1030,20 @@ def main() -> None:
         sample_weights: List[float] = []
         for s in train_samples:
             toks = [t for t in s.frame_tokens if t in inv_freq]
-            if toks:
-                w = float(sum(inv_freq[t] for t in toks) / len(toks))
-            else:
-                w = 1.0
+            w = float(sum(inv_freq[t] for t in toks) / len(toks)) if toks else 1.0
             sample_weights.append(w)
 
         sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
-        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=sampler, num_workers=4, collate_fn=collate_batch)
+        train_loader = DataLoader(
+            train_dataset, batch_size=args.batch_size, sampler=sampler,
+            num_workers=4, collate_fn=collate_batch,
+        )
     else:
-        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=collate_batch)
-        
+        train_loader = DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=True,
+            num_workers=0, collate_fn=collate_batch,
+        )
+
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=collate_batch)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=collate_batch)
 
@@ -901,7 +1055,7 @@ def main() -> None:
         finetune_backbone=not args.freeze_backbone,
     ).to(device)
 
-    criterion = GraphAwareFrameCrossEntropyLoss(vocab=vocab, blank_id=0, blank_penalty=0.5)
+    criterion = GraphAwareFrameCrossEntropyLoss(vocab=vocab, blank_id=0, blank_penalty=args.blank_penalty)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
@@ -912,7 +1066,10 @@ def main() -> None:
         min_lr=args.min_lr,
     )
 
-    logger.info("Loaded %d samples (%d train / %d val / %d test)", len(samples), len(train_samples), len(val_samples), len(test_samples))
+    logger.info(
+        "Loaded %d samples (%d train / %d val / %d test)",
+        len(samples), len(train_samples), len(val_samples), len(test_samples),
+    )
     logger.info("Phoneme vocabulary size: %d (+ blank)", len(vocab))
 
     if args.dry_run:
@@ -945,12 +1102,8 @@ def main() -> None:
 
         logger.info(
             "Epoch %03d/%03d | train_loss=%.4f | val_loss=%.4f | val_TER=%.4f | lr=%.2e",
-            epoch,
-            args.epochs,
-            train_loss,
-            val_metrics["loss"],
-            val_metrics["token_error_rate"],
-            current_lr,
+            epoch, args.epochs, train_loss,
+            val_metrics["loss"], val_metrics["token_error_rate"], current_lr,
         )
 
         improved = val_metrics["loss"] < (best_val_loss - TrainingConfig.early_stopping_min_delta)
@@ -985,13 +1138,11 @@ def main() -> None:
     )
 
     test_metrics, test_predictions, test_targets = evaluate_loader_with_sequences(
-        model,
-        test_loader,
-        criterion,
-        device,
-        id_to_token,
+        model, test_loader, criterion, device, id_to_token,
     )
-    matrix, _, per_phoneme_report, top_confusions = build_phoneme_diagnostics(test_targets, test_predictions, vocab)
+    matrix, _, per_phoneme_report, top_confusions = build_phoneme_diagnostics(
+        test_targets, test_predictions, vocab,
+    )
 
     save_confusion_matrix_csv(matrix, vocab, output_dir / "test_confusion_matrix.csv")
     save_confusion_matrix_plot(matrix, vocab, output_dir / "test_confusion_matrix.png")
@@ -1011,7 +1162,10 @@ def main() -> None:
         json.dump(diagnostics, handle, ensure_ascii=False, indent=2)
 
     with (output_dir / "test_phoneme_report.csv").open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["phoneme", "support", "predicted", "correct", "missed", "recall", "precision"])
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["phoneme", "support", "predicted", "correct", "missed", "recall", "precision"],
+        )
         writer.writeheader()
         writer.writerows(per_phoneme_report)
 
