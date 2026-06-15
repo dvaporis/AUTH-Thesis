@@ -25,10 +25,21 @@ Changes in this version
    raised from 1e-4 → 5e-4.  Together these target the large train/val gap
    observed in the previous run (train ~0.55, val ~1.11 at epoch 22).
 
+3. blank_penalty reverted 2.0 → 0.5.  Doubling it did not reduce insertions:
+   ɪ/ɛ/n insertions went from 70/50/52 to 87/83/69 in the run that used 2.0,
+   and val_loss diverged from val_ter after epoch ~15 (train_loss kept
+   dropping to ~0.34 while val_loss rose to ~1.2), i.e. severe overfitting
+   rather than a blank-dominance problem.  early_stopping_patience lowered
+   from 60 → 8 so training stops shortly after val performance stops
+   improving instead of training ~45 extra overfitting epochs.  Checkpoint
+   selection ("best_model.pt") now tracks val_ter instead of val_loss, since
+   val_ter is the metric we actually care about and the two diverge in the
+   later epochs.
+
 Usage:
     python train_lip_lstm.py --dry-run
     python train_lip_lstm.py --epochs 20 --batch-size 4
-    python train_lip_lstm.py --blank-penalty 1.0  # soften if under-predicting
+    python train_lip_lstm.py --blank-penalty 1.0  # raise if blank-dominance returns
 """
 
 from __future__ import annotations
@@ -95,7 +106,11 @@ class TrainingConfig:
     train_ratio: float = 0.6
     val_ratio: float = 0.2
     test_ratio: float = 0.2
-    early_stopping_patience: int = 60
+    # Lowered from 60 → 8. The previous run's val_loss bottomed out around
+    # epoch 15 and then rose monotonically through epoch 60 while train_loss
+    # kept falling — a patience of 60 let training run ~45 epochs purely
+    # overfitting after the useful minimum had already passed.
+    early_stopping_patience: int = 8
     early_stopping_min_delta: float = 1e-3
 
 
@@ -446,16 +461,20 @@ class GraphAwareFrameCrossEntropyLoss(nn.Module):
 
         blank_penalty * p(blank | frame) * 1[target ≠ blank]
 
-    to the per-frame loss.  This discourages the over-insertion pattern seen
-    in the previous run where high-frequency phonemes (ɪ, n, ɛ, s) were
-    hallucinated at a rate of 44–70 per evaluation set.
+    to the per-frame loss.
 
-    Default blank_penalty raised from 0.5 → 2.0.  Pass --blank-penalty to
-    tune: decrease toward 1.0 if recall on common phonemes drops noticeably,
-    increase above 2.0 if insertions remain dominant.
+    Default blank_penalty is 0.5.  A previous run raised this to 2.0 to try to
+    suppress over-insertion of high-frequency phonemes (ɪ, n, ɛ, s), but that
+    run actually produced *more* insertions of those tokens (87/69/83 vs.
+    70/52/50) and a much larger train/val loss gap, indicating the insertions
+    are driven by frame-level prediction flicker / overfitting rather than
+    blank-dominance.  blank_penalty was reverted to 0.5 accordingly.  Pass
+    --blank-penalty to tune: increase toward 1.0-2.0 only if deletions
+    (frames where the model predicts blank but the target is a real phoneme)
+    become the dominant error mode.
     """
 
-    def __init__(self, vocab: Sequence[str], blank_id: int = 0, blank_penalty: float = 2.0):
+    def __init__(self, vocab: Sequence[str], blank_id: int = 0, blank_penalty: float = 0.5):
         super().__init__()
         self.blank_id = int(blank_id)
         self.blank_penalty = float(blank_penalty)
@@ -953,12 +972,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
-        "--blank-penalty", type=float, default=2.0,
+        "--blank-penalty", type=float, default=0.5,
         help=(
             "Blank-penalty coefficient for GraphAwareFrameCrossEntropyLoss. "
-            "Raised from 0.5 → 2.0 to suppress the insertion errors seen in the "
-            "previous run (70/52/50/44 spurious ɪ/n/ɛ/s insertions). "
-            "Decrease toward 1.0 if common-phoneme recall drops noticeably."
+            "Reverted from 2.0 back to 0.5: raising it to 2.0 in a previous run "
+            "did not reduce insertion errors (ɪ/ɛ/n insertions rose from "
+            "70/50/52 to 87/83/69) and coincided with much worse overfitting. "
+            "Increase toward 1.0-2.0 only if frame-level deletions (predicting "
+            "blank on non-blank frames) become the dominant error mode again."
         ),
     )
     parser.add_argument(
@@ -982,6 +1003,10 @@ def main() -> None:
         "Regularisation: blank_penalty=%.2f  weight_decay=%.2e  "
         "projector_dropout=0.45  lstm_dropout=0.45",
         args.blank_penalty, args.weight_decay,
+    )
+    logger.info(
+        "Early stopping: patience=%d epochs, min_delta=%.4f, selection metric=val_ter",
+        TrainingConfig.early_stopping_patience, TrainingConfig.early_stopping_min_delta,
     )
 
     video_dir = Path(args.video_dir)
@@ -1085,7 +1110,7 @@ def main() -> None:
         logger.info("Dry run Frame Graph CE loss: %.6f", float(loss.item()))
         return
 
-    best_val_loss = float("inf")
+    best_val_ter = float("inf")
     epochs_without_improvement = 0
     history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "val_ter": [], "lr": []}
 
@@ -1106,16 +1131,21 @@ def main() -> None:
             val_metrics["loss"], val_metrics["token_error_rate"], current_lr,
         )
 
-        improved = val_metrics["loss"] < (best_val_loss - TrainingConfig.early_stopping_min_delta)
+        # Checkpoint selection is based on val_ter (not val_loss): a previous
+        # run showed val_loss and val_ter diverging after ~epoch 15 (val_loss
+        # kept rising while val_ter still improved for several more epochs),
+        # and TER is the metric we actually care about.
+        improved = val_metrics["token_error_rate"] < (best_val_ter - TrainingConfig.early_stopping_min_delta)
         if improved:
-            best_val_loss = val_metrics["loss"]
+            best_val_ter = val_metrics["token_error_rate"]
             epochs_without_improvement = 0
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "epoch": epoch,
-                    "val_loss": best_val_loss,
+                    "val_loss": val_metrics["loss"],
+                    "val_ter": best_val_ter,
                     "vocab": vocab,
                     "config": vars(args),
                 },
@@ -1183,7 +1213,7 @@ def main() -> None:
     with (output_dir / "history.json").open("w", encoding="utf-8") as handle:
         json.dump(history, handle, ensure_ascii=False, indent=2)
 
-    logger.info("Training complete. Best val loss: %.4f", best_val_loss)
+    logger.info("Training complete. Best val TER: %.4f", best_val_ter)
     logger.info("Test loss: %.4f | Test TER: %.4f", test_metrics["loss"], test_metrics["token_error_rate"])
 
 
