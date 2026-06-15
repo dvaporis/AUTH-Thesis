@@ -214,7 +214,7 @@ class LipPhonemeDataset(Dataset):
         imagenet_mean = [0.485, 0.456, 0.406]
         imagenet_std = [0.229, 0.224, 0.225]
 
-        # Use modern v2 components to ensure unified sequence transforms
+        # Use updated v2 behavior to consistently transform entire video sequences together
         self.base_transforms = v2.Compose([
             v2.Resize((self.frame_size, self.frame_size), interpolation=v2.InterpolationMode.BILINEAR),
             v2.ToDtype(torch.float32, scale=True),
@@ -262,19 +262,21 @@ class LipPhonemeDataset(Dataset):
         if not frame_tokens:
             raise RuntimeError(f"Empty frame target sequence for {sample.video_path}")
 
+        # Basic structural transformations
         video = self.base_transforms(video)
 
         if self.is_training:
-            # Fix 4: Apply sequence-consistent spatial updates to prevent temporal flicker
+            # Video sequence-consistent augmentation
             if random.random() < 0.5:
                 video = v2.functional.horizontal_flip(video)
                 
             if random.random() < 0.4:
+                # Sequence-level unified Jitter factors to prevent artificial temporal flicker
                 brightness_factor = random.uniform(0.85, 1.15)
                 contrast_factor = random.uniform(0.85, 1.15)
                 saturation_factor = random.uniform(0.95, 1.05)
                 
-                # Unpack sequence normalization to execute color updates safely
+                # Unpack normalization to apply color adjustments safely
                 mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
                 std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
                 
@@ -285,6 +287,7 @@ class LipPhonemeDataset(Dataset):
                 video = (video - mean) / std
 
             if random.random() < 0.2:
+                # Random Cutout across all frames
                 t, c, h, w = video.shape
                 rect_h = max(1, int(h * random.uniform(0.08, 0.23)))
                 rect_w = max(1, int(w * random.uniform(0.08, 0.23)))
@@ -402,14 +405,8 @@ def build_similarity_distribution(vocab: Sequence[str]) -> torch.Tensor:
 
     distribution = torch.zeros_like(similarity_matrix)
     for label_index, label in enumerate(labels):
-        # Fix 3: Label Smoothing via Blank Contamination
-        # Distribute 10% mass uniformly to smooth hard transition boundaries
         if label == DEFAULT_BLANK_TOKEN:
-            distribution[label_index, label_index] = 0.90
-            remainder = 0.10 / (label_count - 1)
-            for j in range(label_count):
-                if j != label_index:
-                    distribution[label_index, j] = remainder
+            distribution[label_index, label_index] = 1.0
             continue
 
         neighbor_scores = similarity_matrix[label_index].clone()
@@ -426,7 +423,13 @@ def build_similarity_distribution(vocab: Sequence[str]) -> torch.Tensor:
 
 
 class GraphAwareFrameCrossEntropyLoss(nn.Module):
-    """Frame-level cross-entropy with graph targets and symmetrical insertion penalties."""
+    """Frame-level cross-entropy with phoneme-similarity targets and balanced penalties.
+
+    Contains symmetrical constraints for both error extremes:
+      1. blank_penalty: Taxes the system for missing a phoneme (predicting blank on true frames).
+      2. insertion_penalty: Taxes the model for failing to match silence by shifting mass away 
+         from blank targets into spurious insertions via focal scaling modulation.
+    """
 
     def __init__(self, vocab: Sequence[str], blank_id: int = 0, blank_penalty: float = 0.5, insertion_penalty: float = 1.0):
         super().__init__()
@@ -454,17 +457,19 @@ class GraphAwareFrameCrossEntropyLoss(nn.Module):
 
         loss = -(target_distributions * flat_log_probs).sum(dim=-1)
 
-        # 1. Deletion Penalty (Target is phoneme, but model predicts blank)
+        # Deletion constraint: Target is a real phoneme, model predicts blank
         if self.blank_penalty > 0.0:
             blank_prob = flat_log_probs.exp()[:, self.blank_id]
             deletion_mask = (flat_targets != self.blank_id).float()
             loss = loss + self.blank_penalty * blank_prob * deletion_mask
 
-        # Fix 1: Insertion Penalty (Target is blank, but model inserts random active phonemes)
+        # Insertion constraint: Target is blank, model drops blank confidence for insertions
         if self.insertion_penalty > 0.0:
             blank_prob = flat_log_probs.exp()[:, self.blank_id]
             insertion_mask = (flat_targets == self.blank_id).float()
-            loss = loss + self.insertion_penalty * (1.0 - blank_prob) * insertion_mask
+            # Scaled focal modulation component
+            focal_weight = torch.pow(1.0 - blank_prob, 2.0)
+            loss = loss + self.insertion_penalty * focal_weight * insertion_mask
 
         return loss.mean()
 
@@ -514,7 +519,7 @@ class VisualLSTMFrameCE(nn.Module):
             bidirectional=True,
             dropout=0.45 if lstm_layers > 1 else 0.0,
         )
-        # Fix 4: Structural Output Temporal Regularization
+        # Added structural temporal output dropout to prevent memorization over top layers
         self.output_dropout = nn.Dropout(0.45)
         self.classifier = nn.Linear(hidden_dim * 2, vocab_size)
 
@@ -530,6 +535,7 @@ class VisualLSTMFrameCE(nn.Module):
         packed_output, _ = self.lstm(packed)
         lstm_output, _ = nn.utils.rnn.pad_packed_sequence(packed_output, batch_first=True)
 
+        # Regulate features before linear classification mapping
         reg_output = self.output_dropout(lstm_output)
         return self.classifier(reg_output)
 
@@ -795,8 +801,7 @@ def build_phoneme_diagnostics(
             if predicted_index is None:
                 continue
 
-            # Cleared the typo fallback condition
-            matrix[actual_index, predicted_index] += 1
+            matrix[actual_index, printed_index if 'printed_index' in locals() else predicted_index] += 1
             stats[predicted_token]["predicted"] += 1
             if actual_token == predicted_token:
                 stats[actual_token]["correct"] += 1
@@ -906,7 +911,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight-decay", type=float, default=5e-4)
+    parser.add_argument("--weight-decay", type=float, default=5e-4,
+                        help="L2 weight decay (raised from 1e-4 → 5e-4 to reduce overfitting)")
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--lstm-layers", type=int, default=2)
     parser.add_argument("--frame-size", type=int, default=224)
@@ -918,9 +924,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-lr", type=float, default=1e-6)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--blank-penalty", type=float, default=0.5)
-    parser.add_argument("--insertion-penalty", type=float, default=1.0)
-    parser.add_argument("--class-aware-sampling", action="store_true")
+    parser.add_argument(
+        "--blank-penalty", type=float, default=0.5,
+        help="Blank-penalty coefficient (taxes predicting blank on active phone frames)",
+    )
+    parser.add_argument(
+        "--insertion-penalty", type=float, default=1.0,
+        help="Insertion-penalty coefficient (taxes predicting active phones on blank/silent frames)",
+    )
+    parser.add_argument(
+        "--class-aware-sampling", action="store_true",
+        help="Use class-aware sampling based on inverse token frequency",
+    )
     return parser
 
 
@@ -947,7 +962,11 @@ def main() -> None:
 
     samples = build_samples(video_dir, phoneme_csv)
     train_samples, val_samples, test_samples = split_samples(
-        samples, train_ratio=0.6, val_ratio=0.2, test_ratio=0.2, seed=args.seed,
+        samples,
+        train_ratio=0.6,
+        val_ratio=0.2,
+        test_ratio=0.2,
+        seed=args.seed,
     )
 
     vocab = build_vocab(samples)
@@ -1014,8 +1033,12 @@ def main() -> None:
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=args.lr_factor, patience=args.lr_patience,
-        threshold=TrainingConfig.early_stopping_min_delta, min_lr=args.min_lr,
+        optimizer,
+        mode="min",
+        factor=args.lr_factor,
+        patience=args.lr_patience,
+        threshold=TrainingConfig.early_stopping_min_delta,
+        min_lr=args.min_lr,
     )
 
     logger.info(
@@ -1023,7 +1046,6 @@ def main() -> None:
         len(samples), len(train_samples), len(val_samples), len(test_samples),
     )
 
-    # Added explicit dry run loss output
     if args.dry_run:
         batch = next(iter(train_loader))
         videos = batch["videos"].to(device)
@@ -1034,7 +1056,6 @@ def main() -> None:
             loss = criterion(logits, frame_targets, video_lengths)
         logger.info("Dry run videos shape: %s", tuple(videos.shape))
         logger.info("Dry run logits shape: %s", tuple(logits.shape))
-        logger.info("Dry run calculated loss: %.4f", loss.item())
         return
 
     best_val_ter = float("inf")
