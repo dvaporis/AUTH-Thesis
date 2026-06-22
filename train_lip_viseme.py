@@ -985,7 +985,81 @@ def evaluate(
 
     return avg, all_preds, all_refs
 
+@torch.no_grad()
+def export_ctc_outputs(
+    model: LipReadingModel,
+    loader: DataLoader,
+    device: torch.device,
+    id2tok: Dict[int, str],
+    output_path: Path,
+    fps: float = 25.0,
+) -> None:
+    """
+    Export raw framewise CTC outputs for later phoneme-timed synthesis.
 
+    Saves per sample:
+      - stem
+      - raw logits (T, V+1)
+      - framewise argmax predictions (including blanks)
+      - collapsed phoneme spans with timestamps
+    """
+    model.eval()
+    results = []
+
+    for batch in tqdm(loader, desc="export logits", leave=False):
+        videos = batch["videos"].to(device)
+        vid_lens = batch["video_lengths"].to(device)
+        stems = batch["stems"]
+
+        logits, _, _ = model(videos, vid_lens)
+
+        for i in range(logits.shape[0]):
+            T = int(vid_lens[i].item())
+
+            sample_logits = logits[i, :T].detach().cpu()
+            frame_ids = sample_logits.argmax(dim=-1).tolist()
+
+            frame_tokens = [
+                id2tok.get(idx, "<unk>")
+                for idx in frame_ids
+            ]
+
+            spans = []
+            current = None
+            start = None
+
+            for t, tok in enumerate(frame_tokens):
+                tok_clean = None if tok == BLANK_TOKEN else tok
+
+                if tok_clean != current:
+                    if current is not None:
+                        spans.append({
+                            "token": current,
+                            "start_sec": start / fps,
+                            "end_sec": t / fps,
+                        })
+                    current = tok_clean
+                    start = t
+
+            if current is not None:
+                spans.append({
+                    "token": current,
+                    "start_sec": start / fps,
+                    "end_sec": T / fps,
+                })
+
+            results.append({
+                "stem": stems[i],
+                "num_frames": T,
+                "frame_predictions": frame_tokens,
+                "spans": spans,
+                "logits": sample_logits.numpy().tolist(),
+            })
+
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+
+    logger.info("Saved CTC outputs to %s", output_path)
 # ---------------------------------------------------------------------------
 # Diagnostics
 # ---------------------------------------------------------------------------
@@ -1411,6 +1485,15 @@ def main() -> None:
     )
 
     phoneme_report(test_preds, test_refs, vocab, output_dir)
+    
+    export_ctc_outputs(
+    model=model,
+    loader=test_loader,
+    device=device,
+    id2tok=id2tok,
+    output_path=output_dir / "ctc_outputs.json",
+    fps=args.fps,
+    )
 
     with (output_dir / "test_metrics.json").open("w") as fh:
         json.dump(test_m, fh, indent=2)
