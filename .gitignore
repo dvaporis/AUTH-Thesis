@@ -37,6 +37,7 @@ phonemes_s1_aligned/
 decode_results/
 eval_results/
 viseme_results/
+ablation_results/
 
 # Python environment
 .venv/
