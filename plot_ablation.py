@@ -55,7 +55,8 @@ def load_results(results_dir: Path) -> List[Dict[str, Any]]:
                 test_m = json.load(fh)
         label = VARIANT_LABELS.get(subdir.name, subdir.name)
         val_acc = [1.0 - v for v in history.get("val_ter", [])]
-        auc = float(np.trapz(val_acc) / max(1, len(val_acc))) if val_acc else 0.0
+        trapz = getattr(np, "trapezoid", None) or getattr(np, "trapz")
+        auc = float(trapz(val_acc) / max(1, len(val_acc))) if val_acc else 0.0
         out.append({
             "name":        subdir.name,
             "label":       label,
@@ -170,7 +171,7 @@ def plot_all(results: List[Dict[str, Any]], output_dir: Path) -> None:
         ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.002, f"{v:.3f}",
                 ha="center", va="bottom", fontsize=9)
     ax.set_ylabel("AUC of Val (1 − TER)")
-    ax.set_title("Area Under Val Accuracy Curve")
+    ax.set_title("Area Under Val (1 − TER) Curve")
     ax.set_ylim(0, max(aucs)*1.15+0.01); ax.grid(True, axis="y", alpha=0.3)
     plt.xticks(fontsize=8)
     _save(fig, output_dir / "08_auc_bar.png")
