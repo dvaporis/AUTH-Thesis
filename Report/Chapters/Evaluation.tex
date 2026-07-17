@@ -9,24 +9,29 @@
 Για τους σκοπούς της συγκεκριμένης μελέτης, η εκπαίδευση περιορίστηκε αποκλειστικά στα 1000 βίντεο του 1ου ηθοποιού (από το s1.zip). Κάθε .mpg βίντεο έχει μήκος 3 δευτερολέπτων, ρυθμό α\-να\-νέ\-ω\-σης frames 25fps, ανάλυση 360x288 pixels και στερεοφωνικό (δικαναλικό) ήχο με ρυθμό δειγματοληψίας 44.1kHz. Η βιντεοληψία γίνεται με τον ομιλητή να κοιτάει ευθεία προς την κάμερα με ουδέτερο παρασκήνιο. Τα βίντεο έχουν τίτλους που αποδίδουν τη φράση που λέγεται σε αυτά (π.χ. η φράση ``bin green in t 5 soon'' λέγεται στο βίντεο με τίτλο bgit5s.mpg), γεγονός που βοηθάει στην εξαγωγή των πραγματικών φωνημάτων (ground truth). Πέραν των βίντεο, το dataset περιλαμβάνει αρχεία ήχου και ένα αρχείο με ακριβείς χρονισμούς λέξεων για κάθε ομιλητή, τα οποία όμως δε χρησιμοποιούνται.
 
 \subsection{Κριτήρια Αξιολόγησης}
+\label{Criteria}
 
 Για την επακριβή αξιολόγηση της μεθοδολογίας και για τη σύγκριση με το state of the art, αποτελεί κρίσιμο βήμα η ορθή επιλογή και ο ακριβής ορισμός των μετρικών και των κριτηρίων αξιολόγησης. Σε όλα (ή κάποια) από τα παρακάτω πειράματα, η μεθοδολογία αξιολογείται με βάση τα παρακάτω κριτήρια:
 
 \begin{itemize}
 
-\item Γράφημα Training Loss vs Epoch: αποδίδει την τιμή της συνάρτησης κόστους στα δεδομένα του training split για κάθε epoch της εκπαίδευσης.
+\item Γράφημα Training Loss vs Epoch: αποδίδει την τιμή της συνάρτησης κόστους στα δεδομένα του training split για κάθε epoch της εκπαίδευσης. Για τον υπολογισμό της αντικειμενικής συνάρτησης, ανατρέξτε στην ενότητα \ref{ModelStructure}.
 
 \item Γράφημα Validation Loss vs Epoch: το ίδιο με παραπάνω αλλά στο validation split.
 
-\item Γράφημα Validation Token Error Rate (TER) vs Epoch: ποσοστό εσφαλμένης πρόβλεψης φω\-νή\-μα\-τος σε επίπεδο token (δηλαδή, στο collapsed sequence και όχι σε επίπεδο για κάθε frame του video) στο validation split για κάθε εποχή. Υπολογίζεται ως η απόσταση edit Levenshtein διά το μήκος αναφοράς.
+\item Γράφημα Validation Token Error Rate (TER) vs Epoch: ποσοστό εσφαλμένης πρόβλεψης φω\-νή\-μα\-τος σε επίπεδο token (δηλαδή, στο collapsed sequence και όχι σε επίπεδο για κάθε frame του video) στο validation split για κάθε εποχή. Υπολογίζεται ως η απόσταση edit Levenshtein διά το μήκος αναφοράς. Για πληροφορίες περί του υπολογισμού της απόστασης Levenshtein ανατρέξτε στην ενότητα \ref{OtherBackground}.
 
-\item Γράφημα Validation Frame Accuracy vs Epoch: ποσοστό ορθών προβλέψεων φωνήματος σε επίπεδο video frame (πριν το sequence collapse) στο validation split για κάθε εποχή.
+\item Γράφημα Validation Frame Accuracy vs Epoch: ποσοστό ορθών προβλέψεων φωνήματος σε επίπεδο video frame (πριν το sequence collapse) στο validation split για κάθε εποχή. Άρα, αν το βίντεο αποτελείται από $T$ frames, έχουμε 
+
+\[
+val\_frame\_acc = \frac{\# \text{ correct predictions}}{T}
+\]
 
 \item Γράφημα Training Frame Accuracy vs Epoch: το ίδιο με παραπάνω αλλά στο training split.
 
 \item Area Under Curve (AUC): υπολογίζει την επιφάνεια κάτω από την καμπύλη (συνήθως της ακρίβειας στο validation set vs epoch), δίνοντας μία μετρική τόσο για την τελική ακρίβεια όσο και για την ταχύτητα σύγκλισης και για την αποφυγή ταλαντώσεων. 
 
-\item Test Token Error Rate (TER): ποσοστό εσφαλμένων προβλέψεων φωνημάτων μετά το sequence collapse στο test set.
+\item Test Token Error Rate (TER): ποσοστό εσφαλμένων προβλέψεων φωνημάτων μετά το sequence collapse στο test set. Όπως παραπάνω, αξιοποιεί την απόσταση Levenshtein της πραγματικής και της προβλεπόμενης αλληλουχίας φωνημάτων.
 
 \item Test Frame Accuracy: ποσοστό ακριβών προβλέψεων φωνημάτων σε επίπεδο frame, δηλαδή πριν το sequence collapse. 
 
@@ -34,9 +39,10 @@
 
 \subsection{Πειράματα}
 
-Present a series of experiments, showcase and compare the results of each experiment to the state of the art and finally comment on each experiment. The following experiments are subject to change:
+Παρακάτω παρουσιάζονται τα πειράματα με τα οποία δοκιμάστηκε η επίδοση της προτεινόμενης μεθοδολογίας. 
 
 \subsubsection{Πείραμα 1: Πρόβλεψη φωνημάτων από βουβό βίντεο σε περιορισμένο περιβάλλον}
+\label{Experiment1}
 
 \paragraph{Υποπείραμα 1: Μελέτη Αφαίρεσης}
 
