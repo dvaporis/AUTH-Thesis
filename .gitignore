@@ -6,6 +6,7 @@ ravdess_videos_only
 data/
 s1/
 s1_lip_crops/
+av_noise_s1/
 
 # Models
 hifi-gan/
@@ -38,6 +39,7 @@ decode_results/
 eval_results/
 viseme_results/
 ablation_results/
+av_fusion_results/
 
 # Python environment
 .venv/
