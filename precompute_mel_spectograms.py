@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Precompute log-mel spectrograms for the corrupted audio in a noise
-manifest (from add_av_noise.py), so train_av_fusion.py doesn't recompute
-the same deterministic STFT + mel-filterbank + dB conversion on every
-single epoch of training.
+"""Precompute log-mel spectrograms for the audio referenced by a manifest
+(typically the corrupted audio in a noise manifest from add_av_noise.py),
+so train_av_fusion.py doesn't recompute the same deterministic STFT +
+mel-filterbank + dB conversion on every single epoch of training.
 
 Why this is safe to cache
 --------------------------
@@ -25,6 +25,11 @@ those for an experiment, regenerate the cache. train_av_fusion.py detects a
 mismatched cached shape and falls back to on-the-fly computation with a
 warning rather than silently feeding the wrong-shaped features.
 
+If you pass --audio-source-dir, the script resolves each stem against the
+clean source audio files in that directory, writes those clean paths back
+into the output manifest, and sets audio_reliability to 1.0 for every frame.
+That is the recommended mode for a clean-audio-only run.
+
 Audio loading and the core mel computation reuse the same backend chain
 (PyAV -> librosa -> ffmpeg subprocess) and compute_mel() pattern as
 preprocess_mels_full.py / preprocess_ravdess_audio.py, since the corrupted
@@ -35,7 +40,8 @@ Usage
 -----
     python precompute_mel_spectrograms.py \
         --noise-manifest av_noise_s1/noise_manifest.csv \
-        --output-dir av_noise_s1
+        --audio-source-dir s1 \
+        --output-dir av_clean_audio_s1
 
     python precompute_mel_spectrograms.py --dry-run
 """
@@ -45,6 +51,7 @@ from __future__ import annotations
 import argparse
 import csv
 import importlib
+import json
 import logging
 import subprocess
 import tempfile
@@ -71,6 +78,7 @@ if librosa is None:
 
 VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".mpg", ".mpeg")
 AUDIO_EXTS = (".wav", ".flac", ".mp3", ".ogg")
+SOURCE_AUDIO_EXTS = VIDEO_EXTS + AUDIO_EXTS
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +102,15 @@ def resolve_ffmpeg_executable() -> Optional[str]:
         except Exception:
             return None
     return None
+
+
+def build_audio_source_index(audio_source_dir: Path) -> Dict[str, Path]:
+    index: Dict[str, Path] = {}
+    for p in audio_source_dir.rglob("*"):
+        if p.is_file() and p.suffix.lower() in SOURCE_AUDIO_EXTS:
+            index[p.stem.lower()] = p
+    log.info("Indexed %d clean source audio/AV file(s) in %s", len(index), audio_source_dir)
+    return index
 
 
 def load_audio(path: Path, sr: int) -> np.ndarray:
@@ -219,6 +236,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--noise-manifest", default="av_noise_s1/noise_manifest.csv",
                    help="Manifest produced by add_av_noise.py (must have 'stem' and 'audio_path' columns).")
+    p.add_argument("--audio-source-dir", default="",
+                   help="Optional directory containing the clean source audio/AV files matched by stem. "
+                        "When set, each row's audio_path is rewritten to the clean source file and the "
+                        "output manifest marks audio_reliability as 1.0 for all frames.")
     p.add_argument("--output-dir", default="",
                    help="Where to write mel_cache/ and the augmented manifest. Defaults to the "
                         "noise manifest's own directory.")
@@ -247,6 +268,9 @@ def main() -> None:
     )
     mel_cache_dir = output_dir / "mel_cache"
     mel_cache_dir.mkdir(parents=True, exist_ok=True)
+    audio_source_index: Optional[Dict[str, Path]] = None
+    if args.audio_source_dir:
+        audio_source_index = build_audio_source_index(Path(args.audio_source_dir))
 
     hop_length = args.hop_length if args.hop_length > 0 else int(round(args.sample_rate / args.fps))
     log.info(
@@ -272,6 +296,13 @@ def main() -> None:
             log.warning("Skipping row %d: missing stem/audio_path", i)
             continue
 
+        if audio_source_index is not None:
+            clean_audio_path = audio_source_index.get(stem.lower())
+            if clean_audio_path is None:
+                log.warning("Skipping %s: no clean source audio found in %s", stem, args.audio_source_dir)
+                continue
+            audio_path = clean_audio_path
+
         try:
             waveform = load_audio(audio_path, sr=args.sample_rate)
             mel = compute_normalized_mel(waveform, args.sample_rate, args.n_mels, args.n_fft, hop_length)
@@ -294,6 +325,9 @@ def main() -> None:
         np.save(mel_path, mel)
 
         row = dict(row)
+        if audio_source_index is not None:
+            row["audio_path"] = str(audio_path)
+            row["audio_reliability"] = json.dumps([1.0] * int(row.get("num_frames", mel.shape[0]) or mel.shape[0]))
         row["mel_path"] = str(mel_path)
         processed_rows.append(row)
 
@@ -323,6 +357,7 @@ def main() -> None:
             mismatch_count, len(processed_rows),
         )
     log.info("Point train_av_fusion.py at this manifest with --noise-manifest %s", output_manifest_path)
+
 
 
 if __name__ == "__main__":

@@ -40,6 +40,10 @@ eval_results/
 viseme_results/
 ablation_results/
 av_fusion_results/
+snr_sweep_results/
+av_clean_audio_test/
+av_fusion_results_clean_test/
+video_sweep_results/
 
 # Python environment
 .venv/

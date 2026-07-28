@@ -829,18 +829,29 @@ class AVLipReadingModel(nn.Module):
         cross_attn_heads: int = 4,
         use_aux_heads: bool = True,
         modality_dropout: float = 0.15,
+        modality: str = "av",
     ):
         super().__init__()
-        self.video_frontend = Conv3DFrontEnd(hidden_dim=hidden_dim, dropout=frontend_dropout)
-        self.audio_frontend = AudioMelFrontEnd(hidden_dim=hidden_dim, n_mels=n_mels, dropout=frontend_dropout)
-        self.pos_enc_v = SinusoidalPositionalEncoding(hidden_dim, dropout=0.1)
-        self.pos_enc_a = SinusoidalPositionalEncoding(hidden_dim, dropout=0.1)
+        if modality not in {"av", "audio", "video"}:
+            raise ValueError(f"Unknown modality: {modality}")
+        self.modality = modality
+        self.use_video = modality in {"av", "video"}
+        self.use_audio = modality in {"av", "audio"}
+
+        self.video_frontend = Conv3DFrontEnd(hidden_dim=hidden_dim, dropout=frontend_dropout) if self.use_video else None
+        self.audio_frontend = AudioMelFrontEnd(hidden_dim=hidden_dim, n_mels=n_mels, dropout=frontend_dropout) if self.use_audio else None
+        self.pos_enc_v = SinusoidalPositionalEncoding(hidden_dim, dropout=0.1) if self.use_video else None
+        self.pos_enc_a = SinusoidalPositionalEncoding(hidden_dim, dropout=0.1) if self.use_audio else None
         self.modality_dropout = modality_dropout
 
-        self.cross_layers = nn.ModuleList([
-            CrossModalAttention(hidden_dim, num_heads=cross_attn_heads) for _ in range(cross_attn_layers)
-        ])
-        self.fusion = ReliabilityGatedFusion(hidden_dim)
+        if self.modality == "av":
+            self.cross_layers = nn.ModuleList([
+                CrossModalAttention(hidden_dim, num_heads=cross_attn_heads) for _ in range(cross_attn_layers)
+            ])
+            self.fusion = ReliabilityGatedFusion(hidden_dim)
+        else:
+            self.cross_layers = nn.ModuleList()
+            self.fusion = None
 
         self.encoder_type = encoder
         if encoder == "bilstm":
@@ -866,8 +877,10 @@ class AVLipReadingModel(nn.Module):
 
         self.use_aux_heads = use_aux_heads
         if use_aux_heads:
-            self.aux_video_classifier = nn.Linear(hidden_dim, vocab_size + 1)
-            self.aux_audio_classifier = nn.Linear(hidden_dim, vocab_size + 1)
+            if self.use_video:
+                self.aux_video_classifier = nn.Linear(hidden_dim, vocab_size + 1)
+            if self.use_audio:
+                self.aux_audio_classifier = nn.Linear(hidden_dim, vocab_size + 1)
 
     def _apply_modality_dropout(self, video_feat: torch.Tensor, audio_feat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if not self.training or self.modality_dropout <= 0.0:
@@ -887,17 +900,38 @@ class AVLipReadingModel(nn.Module):
         self, videos: torch.Tensor, mel: torch.Tensor, video_lengths: torch.Tensor,
         video_reliability: torch.Tensor, audio_reliability: torch.Tensor,
     ):
-        video_feat = self.pos_enc_v(self.video_frontend(videos))
-        audio_feat = self.pos_enc_a(self.audio_frontend(mel))
-        video_feat, audio_feat = self._apply_modality_dropout(video_feat, audio_feat)
+        video_feat = self.pos_enc_v(self.video_frontend(videos)) if self.use_video else None
+        audio_feat = self.pos_enc_a(self.audio_frontend(mel)) if self.use_audio else None
 
-        T_max = video_feat.size(1)
+        if self.modality == "av":
+            assert video_feat is not None and audio_feat is not None
+            video_feat, audio_feat = self._apply_modality_dropout(video_feat, audio_feat)
+
+            T_max = video_feat.size(1)
+            pad_mask = torch.arange(T_max, device=video_lengths.device).unsqueeze(0) >= video_lengths.unsqueeze(1)
+
+            for layer in self.cross_layers:
+                video_feat, audio_feat = layer(video_feat, audio_feat, key_padding_mask=pad_mask)
+
+            assert self.fusion is not None
+            fused, gates = self.fusion(video_feat, audio_feat, video_reliability, audio_reliability)
+            aux_video_logits = self.aux_video_classifier(video_feat) if self.use_aux_heads else None
+            aux_audio_logits = self.aux_audio_classifier(audio_feat) if self.use_aux_heads else None
+        else:
+            feature = video_feat if self.use_video else audio_feat
+            if feature is None:
+                raise RuntimeError("No active modality features were produced.")
+            fused = feature
+            gates = feature.new_zeros(feature.size(0), feature.size(1), 2)
+            if self.modality == "video":
+                gates[..., 0] = 1.0
+            else:
+                gates[..., 1] = 1.0
+            aux_video_logits = self.aux_video_classifier(feature) if self.use_aux_heads and self.use_video else None
+            aux_audio_logits = self.aux_audio_classifier(feature) if self.use_aux_heads and self.use_audio else None
+
+        T_max = fused.size(1)
         pad_mask = torch.arange(T_max, device=video_lengths.device).unsqueeze(0) >= video_lengths.unsqueeze(1)
-
-        for layer in self.cross_layers:
-            video_feat, audio_feat = layer(video_feat, audio_feat, key_padding_mask=pad_mask)
-
-        fused, gates = self.fusion(video_feat, audio_feat, video_reliability, audio_reliability)
 
         if self.encoder_type == "bilstm":
             packed = nn.utils.rnn.pack_padded_sequence(
@@ -912,9 +946,6 @@ class AVLipReadingModel(nn.Module):
         enc_out = self.dropout(enc_out)
         logits = self.classifier(enc_out)
         log_probs_ctc = F.log_softmax(logits, dim=-1).transpose(0, 1)
-
-        aux_video_logits = self.aux_video_classifier(video_feat) if self.use_aux_heads else None
-        aux_audio_logits = self.aux_audio_classifier(audio_feat) if self.use_aux_heads else None
 
         return logits, log_probs_ctc, video_lengths, aux_video_logits, aux_audio_logits, gates
 
@@ -1238,7 +1269,7 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-mels", type=int, default=80)
 
     p.add_argument("--batch-size", type=int, default=4)
-    p.add_argument("--epochs", type=int, default=40)
+    p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--grad-clip", type=float, default=1.0)
@@ -1257,6 +1288,8 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--cross-attn-layers", type=int, default=1)
     p.add_argument("--cross-attn-heads", type=int, default=4)
     p.add_argument("--no-aux-heads", action="store_true", help="Disable auxiliary per-modality CTC heads.")
+    p.add_argument("--modality", choices=["av", "audio", "video"], default="av",
+                   help="Train the fused AV model, an audio-only model, or a video-only model.")
     p.add_argument("--modality-dropout", type=float, default=0.15,
                    help="Probability of dropping each modality stream during training, independently.")
 
@@ -1341,7 +1374,7 @@ def main() -> None:
         frontend_dropout=args.lstm_dropout, transformer_heads=args.transformer_heads,
         transformer_layers=args.transformer_layers, cross_attn_layers=args.cross_attn_layers,
         cross_attn_heads=args.cross_attn_heads, use_aux_heads=not args.no_aux_heads,
-        modality_dropout=args.modality_dropout,
+        modality_dropout=args.modality_dropout, modality=args.modality,
     ).to(device)
 
     criterion = AVFusionLoss(
