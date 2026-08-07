@@ -44,6 +44,8 @@ snr_sweep_results/
 av_clean_audio_test/
 av_fusion_results_clean_test/
 video_sweep_results/
+snr_sweep_plots/
+video_sweep_plots/
 
 # Python environment
 .venv/
