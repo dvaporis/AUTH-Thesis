@@ -205,3 +205,136 @@ V6 — BiLSTM + Hard Targets & 0.1266 & 0.1289 & 0.8456 & 0.7696 & 9 \\ \hline
 \subsubsection{Πείραμα 2: Πρόβλεψη φωνημάτων από βουβό βίντεο σε μη περιορισμένο (in the wild) περιβάλλον}
 
 \subsubsection{Πείραμα 3: Πρόβλεψη φωνημάτων με συνδυασμό οπτικών και ακουστικών στοιχείων}
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{best_val_ter_vs_snr_db.png}
+	\caption{Γραφήματα τιμών του βέλτιστου val TER για διάφορες τιμές audio SNR}
+	\label{best_val_ter_vs_snr_db}
+\end{figure}
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{epoch_train_total_by_snr_db.png}
+	\caption{Γραφήματα τιμών train loss per epoch για διάφορες τιμές audio SNR}
+\end{figure}
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{epoch_val_gate_audio_by_snr_db.png}
+	\caption{Γραφήματα τιμών της audio gate στο validation set per epoch για διάφορες τιμές audio SNR}
+\end{figure}
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{epoch_val_gate_video_by_snr_db.png}
+	\caption{Γραφήματα τιμών της video gate στο validation set per epoch για διάφορες τιμές audio SNR}
+\end{figure}
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{epoch_val_ter_by_snr_db.png}
+	\caption{Γραφήματα τιμών val TER per epoch για διάφορες τιμές audio SNR}
+\end{figure}
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{epoch_val_total_by_snr_db.png}
+	\caption{Γραφήματα τιμών val loss per epoch για διάφορες τιμές audio SNR}
+\end{figure}
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{epochs_ran_vs_snr_db.png}
+	\caption{Γράφημα αριθμού εποχών εκπαίδευσης για διάφορες τιμές audio SNR}
+\end{figure}
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{test_gate_audio_vs_snr_db.png}
+	\caption{Γράφημα τιμών της audio gate στο test set για διάφορες τιμές audio SNR}
+\end{figure}
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{test_gate_video_vs_snr_db.png}
+	\caption{Γράφημα τιμών της video gate στο test set για διάφορες τιμές audio SNR}
+\end{figure}
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{test_loss_vs_snr_db.png}
+	\caption{Γράφημα τιμών της loss function στο test set για διάφορες τιμές audio SNR}
+\end{figure}
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{test_ter_vs_snr_db.png}
+	\caption{Γράφημα τιμών του TER στο test set για διάφορες τιμές audio SNR}
+\end{figure}
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{best_val_ter_vs_video_obstruct_frames.png}
+	\caption{Γράφημα τιμών του βέλτιστου val TER για διάφορες τιμές obstructed video frames}
+\end{figure}
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{epoch_train_total_by_video_obstruct_frames.png}
+	\caption{Γραφήματα τιμών train loss per epoch για διάφορες τιμές obstructed video frames}
+\end{figure}
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{epoch_val_gate_audio_by_video_obstruct_frames.png}
+	\caption{Γραφήματα τιμών της audio gate στο validation set per epoch για διάφορες τιμές obstructed video frames}
+\end{figure}
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{epoch_val_gate_video_by_video_obstruct_frames.png}
+	\caption{Γραφήματα τιμών της video gate στο validation set per epoch για διάφορες τιμές obstructed video frames}
+\end{figure}
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{epoch_val_ter_by_video_obstruct_frames.png}
+	\caption{Γραφήματα τιμών val TER per epoch για διάφορες τιμές obstructed video frames}
+\end{figure}
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{epoch_val_total_by_video_obstruct_frames.png}
+	\caption{Γραφήματα τιμών val loss per epoch για διάφορες τιμές obstructed video frames}
+\end{figure}
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{epochs_ran_vs_video_obstruct_frames.png}
+	\caption{Γράφημα αριθμού εποχών εκπαίδευσης για διάφορες τιμές obstructed video frames}
+\end{figure}
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{test_gate_audio_vs_video_obstruct_frames.png}
+	\caption{Γράφημα τιμών της audio gate στο test set για διάφορες τιμές obstructed video frames}
+\end{figure}
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{test_gate_video_vs_video_obstruct_frames.png}
+	\caption{Γράφημα τιμών της video gate στο test set για διάφορες obstructed video frames}
+\end{figure}
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{test_loss_vs_video_obstruct_frames.png}
+	\caption{Γράφημα τιμών της loss function στο test set για διάφορες τιμές obstructed video frames}
+\end{figure}
+
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=0.7\textwidth]{test_ter_vs_video_obstruct_frames.png}
+	\caption{Γράφημα τιμών του TER στο test set για διάφορες τιμές audio SNR}
+\end{figure}
