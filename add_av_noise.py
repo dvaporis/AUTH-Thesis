@@ -81,7 +81,7 @@ AUDIO_NOISE_TYPES = ("white", "babble")
 # treated as (almost) unusable; above snr_ceiling_db it's treated as clean.
 SNR_FLOOR_DB = -5.0
 SNR_CEILING_DB = 20.0
-DROPOUT_RELIABILITY = 0.05  # residual reliability for fully-dropped-out spans
+DROPOUT_RELIABILITY = 0.0  # fully-dropped-out spans are entirely unreliable
 
 
 # ---------------------------------------------------------------------------

@@ -163,14 +163,8 @@ def plot_summary_metric(
         plt.close(fig)
         return False
 
-    direction = ""
-    if lower_is_better is True:
-        direction = " (lower is better)"
-    elif lower_is_better is False:
-        direction = " (higher is better)"
-
     ax.set_xlabel(x_label)
-    ax.set_ylabel(metric_label + direction)
+    ax.set_ylabel(metric_label)
     ax.set_title(f"{metric_label} vs {x_label}")
     ax.grid(True, alpha=0.3)
     ax.legend(title="modality")
