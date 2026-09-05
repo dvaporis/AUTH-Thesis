@@ -203,6 +203,86 @@ V6 — BiLSTM + Hard Targets & 0.1266 & 0.1289 & 0.8456 & 0.7696 & 9 \\ \hline
 
 Για να κριθεί ο χρονισμός (timing) της πρόβλεψης και όχι μόνο η ορθότητα του περιεχομένου, χρησιμοποιήθηκε το ffmpeg ώστε να υποτιτλιστούν μερικά από τα video του test set με τις λέξεις που προβλέπονται στον χρόνο που προβλέπονται τα φωνήματα τα οποία παράγουν τις λέξεις. Η διαδικασία αυτή δεν μπορεί να παρουσιαστεί στο πλαίσιο της συγκεκριμένης αναφοράς, παρουσιάζει ωστόσο ιδιαίτερα ακριβή αποτελέσματα, ειδικά, φυσικά, όταν η πρόβλεψη ολόκληρης της φράσης είναι σωστή. 
 \subsubsection{Πείραμα 2: Πρόβλεψη φωνημάτων από βουβό βίντεο σε μη περιορισμένο (in the wild) περιβάλλον}
+\label{Experiment2}
+Στο συγκεκριμένο πείραμα, στόχος είναι η δοκιμή του μοντέλου σε συνθήκες μη περιορισμένου περιβάλλοντος (in the wild). Το πρόβλημα αυτό είναι σαφώς πιο δύσκολο, διότι τόσο το ίδιο το λεξιλόγιο που χρησιμοποιείται (θεωρητικά, ολόκληρη η αγγλική γλώσσα) όσο και η ποικιλομορφία του συντακτικού που χρησιμοποιείται (όχι αυστηρό όπως στο GRID) καθιστούν την πρόβλεψη λέξεων μονάχα από το βίντεο προβληματική. Στα πλαίσια των δοκιμών αυτών, θα γινόταν χρήση των ευρέως διαδεδομένων datasets LRS2 και LRS3 (βλ. \cite{Afouras18c}, \cite{Chung16}, \cite{Chung17}, \cite{Chung17a}). Ωστόσο, λόγω δυσκολιών απόκτησης πρόσβασης στο συγκεκριμένο dataset, ήταν αδύνατη η σύγκριση του μοντέλου με τα state-of-the-art μοντέλα. Το πείραμα αυτό είναι η βασική μελλοντική επέκταση, όπως αναφέρεται και στην ενότητα \ref{Future}.
+
+Για λόγους πληρότητας, παρουσιάζονται στους πίνακες \ref{tab:sota_comparison} και \ref{tab:sota_comparison_lrs2} οι επιδόσεις διάφορων μοντέλων του state-of-the-art, όπως παρουσιάζονται στο \cite{thomas2026vallrvisualasrlanguage}. Τα μοντέλα είναι χωρισμένα με βάση τον τρόπο εκπαίδευσής τους, ενώ αναφέρονται και οι ώρες labeled και unlabeled δεδομένων που αξιοποιούνται, όπως και το word error rate (WER ως ποσοστό) που επιτυγχάνουν.
+ 
+\begin{table}[h]
+\centering
+\caption{Σύγκριση επιδόσεων state-of-the-art μοντέλων στο dataset LRS3}
+\label{tab:sota_comparison}
+\begin{tabular}{l c c c}
+\toprule
+\textbf{Method} & \textbf{Unlabeled (hrs)} & \textbf{Labeled (hrs)} & \textbf{WER (\%)} \\
+\midrule
+\multicolumn{4}{l}{\textit{Fully supervised models with publicly available data}} \\
+\midrule
+ASR distillation \cite{afouras2020asrneedcrossmodaldistillation}        & --      & 590     & 68.8 \\
+Conv-Seq2Seq \cite{9009091}          & --      & 855     & 60.1 \\
+Discriminative \cite{xu2020discriminativemultimodalityspeechrecognition}    & --      & 590     & 57.8 \\
+Hyb. + Conformer \cite{petridis2018endtoendaudiovisualspeechrecognition}       & --      & 590     & 43.3 \\
+VTP \cite{prajwal2021subwordlevellipreading}                  & --      & 698     & 40.6 \\
+\midrule
+\multicolumn{4}{l}{\textit{Trained on large-scale non-publicly available datasets}} \\
+\midrule
+Deep-AV-SR \cite{Afouras_2022}              & --        & 1{,}519       & 58.9 \\
+Large-scale AV-SR \cite{shillingford2018largescalevisualspeechrecognition}      & --        & 3{,}886       & 55.1 \\
+RNN-T \cite{makino2019recurrentneuralnetworktransducer}                 & --        & 31{,}000      & 33.6 \\
+VTP \cite{prajwal2021subwordlevellipreading}                    & --        & 2{,}676       & 30.7 \\
+ViT-3D \cite{serdyuk2022transformerbasedvideofrontendsaudiovisual}                 & --        & 90{,}000      & 17.0 \\
+LP \cite{chang2023conformersneedvisualspeech}                      & --        & 1{,}000{,}000 & 12.5 \\
+\midrule
+\multicolumn{4}{l}{\textit{Self-supervised pre-training + Supervised fine-tuning on LRS3}} \\
+\midrule
+LiRA \cite{ma2021liralearningvisualspeech}                   & 433       & 30    & 71.9 \\
+ASR distillation \cite{afouras2020asrneedcrossmodaldistillation}        & 334       & 590   & 59.8 \\
+LiteVSR \cite{laux2023litevsrefficientvisualspeech}                & 639       & 59    & 45.7 \\
+ES3 \cite{Zhang_2024_CVPR}                    & 433       & 30    & 43.5 \\
+AV-HuBERT Large \cite{shi2022learningaudiovisualspeechrepresentation}        & 1{,}759   & 30    & 32.5 \\
+Lip2Vec \cite{djilali2023lip2vecefficientrobustvisual}               & 1{,}759   & 30    & 31.2 \\
+Sub-Word \cite{prajwal2021subwordlevellipreading}               & 2{,}676   & 2{,}676 & 30.7 \\
+SynthVSR \cite{liu2023synthvsrscalingvisualspeech}                & 3{,}652   & 438   & 27.9 \\
+Whisper \cite{prajwal24_interspeech}                & 1{,}759   & 30    & 25.5 \\
+Auto-AVSR \cite{Ma_2023}              & 1{,}759   & 433   & 25.0 \\
+LLaMA-AVSR \cite{cappellazzo2025largelanguagemodelsstrong}              & --        & 1{,}756 & 24.0 \\
+RAVEn \cite{haliassos2023jointlylearningvisualauditory}                  & 1{,}759   & 433   & 23.1 \\
+USR \cite{haliassos2024unifiedspeechrecognitionsingle}                    & 1{,}326   & 433   & 21.5 \\
+\midrule
+\multicolumn{4}{l}{\textit{Supervised finetuning only on LRS3}} \\
+\midrule
+VALLR \cite{thomas2026vallrvisualasrlanguage}             & --      & 30      & 18.7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Σύγκριση επιδόσεων state-of-the-art μοντέλων στο dataset LRS2}
+\label{tab:sota_comparison_lrs2}
+\begin{tabular}{l c c c}
+\toprule
+\textbf{Method} & \textbf{Unlabeled (hrs)} & \textbf{Labeled (hrs)} & \textbf{WER (\%)} \\
+\midrule
+\multicolumn{4}{l}{\textit{Fully supervised models with publicly available data}} \\
+\midrule
+Auto-AVSR \cite{Ma_2023}           & --      & 818     & 27.9 \\
+Auto-AVSR \cite{Ma_2023}           & --      & 3{,}448 & 14.6 \\
+\midrule
+\multicolumn{4}{l}{\textit{Self-supervised pre-training + Supervised finetuning on LRS2 for AVSR}} \\
+\midrule
+LiRA \cite{ma2021liralearningvisualspeech}                      & 1{,}759   & 433   & 38.8 \\
+ES3 \cite{Zhang_2024_CVPR}                        & 1{,}759   & 223   & 26.7 \\
+Sub-Word \cite{prajwal2021subwordlevellipreading}               & 2{,}676   & 2{,}676 & 22.6 \\
+RAVEn \cite{haliassos2023jointlylearningvisualauditory}                    & 1{,}759   & 223   & 17.9 \\
+USR \cite{haliassos2024unifiedspeechrecognitionsingle}                        & 1{,}759   & 223   & 15.4 \\
+\midrule
+\multicolumn{4}{l}{\textit{Supervised finetuning only on LRS2}} \\
+\midrule
+VALLR  \cite{thomas2026vallrvisualasrlanguage}                        & --      & 28      & 20.8 \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \subsubsection{Πείραμα 3: Πρόβλεψη φωνημάτων με συνδυασμό οπτικών και ακουστικών στοιχείων}
 \label{Experiment 3}
