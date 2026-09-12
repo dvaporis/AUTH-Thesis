@@ -91,3 +91,17 @@ Thumbs.db
 # Slurm files
 *.sh
 *.out
+
+# LaTeX files
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+*.fdb_latexmk
+*.fls
+*.bbl
+*.blg
+*.nav
+*.snm
+*.vrb
