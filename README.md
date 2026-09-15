@@ -31,6 +31,42 @@ phonemes_s1_aligned/phoneme_predictions.csv
 
 The GRID filenames encode a six-word sentence. For example, `bbaf2n` decodes to `bin blue at f 2 now`. `extract_phonemes.py` uses that filename grammar, eSpeak-NG, and wav2vec2 forced alignment to create canonical phonemes and frame-level labels at 25 FPS.
 
+## Current evidence
+
+The headline results below come from the constrained GRID test evaluation described in `Report/Chapters/Evaluation.tex`. The word-level decoder uses the known GRID grammar and vocabulary, so these numbers should not be interpreted as unrestricted-vocabulary lip-reading results.
+
+| Metric | Test result | Interpretation |
+| --- | ---: | --- |
+| Word-correct prediction rate | **87.1%** | Individual GRID words decoded correctly. |
+| Exact sentence match | **38.0%** | All six words in a GRID sentence decoded correctly. |
+| Test phoneme TER | **12.41%** | Token error rate from the constrained visual model evaluation. |
+| Best ablation test frame accuracy | **84.74%** | BiLSTM with full loss, before sequence collapse. |
+
+### Qualitative and experiment figures
+
+The confusion matrix shows the phoneme-level behavior on the test set. The TER curves show how validation performance changes as audio SNR or video obstruction severity varies.
+
+![Test phoneme confusion matrix](Report/figures/constrained_confusion_matrix.png)
+
+![Test TER versus audio SNR](Report/figures/test_ter_vs_snr_db.png)
+
+![Test TER versus video obstruction](Report/figures/test_ter_vs_video_obstruct_frames.png)
+
+The complete figure collection is in [`Report/figures`](Report/figures), including training curves, gate behavior, augmentation examples, and the ablation plots.
+
+### Ablation summary
+
+| Variant | Test TER | Test frame accuracy | AUC validation accuracy |
+| --- | ---: | ---: | ---: |
+| BiLSTM + full loss | 0.1219 | 0.8474 | 0.7840 |
+| Transformer + full loss | 0.1566 | 0.8394 | 0.7176 |
+| No sequence encoder | 0.2464 | 0.8122 | 0.6006 |
+| BiLSTM + CTC only | 0.1869 | 0.4743 | 0.6005 |
+| BiLSTM + frame-CE only | 0.1419 | 0.8401 | 0.7402 |
+| BiLSTM + hard targets | 0.1289 | 0.8456 | 0.7696 |
+
+These values are also stored in [`ablation_results/ablation_summary.json`](ablation_results/ablation_summary.json) when generated locally. Generated result directories are ignored by Git in a clean checkout; the figures in `Report/figures` are the tracked presentation artifacts.
+
 ## Repository layout
 
 ### Active GRID scripts
@@ -61,7 +97,14 @@ Generated datasets, checkpoints, manifests, and plots are kept in result directo
 
 ## Requirements
 
-The project is written for Python 3. The repository contains a virtual environment at `.venv` on the development machine, but a new environment can be created as follows.
+The project is written for Python 3. The active environment is intentionally separated from the historical experiment environment:
+
+- [`requirements-core.txt`](requirements-core.txt) contains pinned dependencies for the active GRID pipeline.
+- [`requirements-dev.txt`](requirements-dev.txt) adds the test runner.
+- [`requirements-legacy.txt`](requirements-legacy.txt) preserves the broad, unpinned historical stack for RAVDESS, EnCodec, diffusion, and contrastive experiments.
+- [`requirements.txt`](requirements.txt) is the default entry point and includes only the core requirements.
+
+The core pins are based on the tested development environment. PyTorch CUDA wheels can be platform-specific; if the standard PyPI install is not appropriate for your GPU, install a matching PyTorch build first and then install the remaining core dependencies.
 
 ### Windows PowerShell setup
 
@@ -69,7 +112,7 @@ The project is written for Python 3. The repository contains a virtual environme
 py -3 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m pip install -r requirements-core.txt
 ```
 
 If PowerShell blocks activation for the current terminal, run:
@@ -83,6 +126,18 @@ When the `python` command resolves to the Microsoft Store alias, call the enviro
 
 ```powershell
 .\.venv\Scripts\python.exe --version
+```
+
+For tests and development checks:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+```
+
+To reproduce a legacy experiment, install the additional historical stack only when needed:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-legacy.txt
 ```
 
 ### External tools
@@ -340,6 +395,22 @@ The variants compare the baseline BiLSTM, Transformer and projection-only sequen
 - Use `--seed` where available when comparing runs.
 - Use `--num-workers 0` on Windows if DataLoader worker startup causes problems.
 - Cached mel files are valid only for the same FPS, sample rate, FFT, mel-bin, and hop-length settings used during training.
+
+## Generalization and evaluation scope
+
+The reported results use the current `s1/` data path and therefore represent a speaker-specific GRID experiment, not a speaker-independent benchmark. GRID contains 34 speakers; the repository does not yet contain a completed leave-one-speaker-out or held-out-speaker result. This is an explicit limitation, not an implied claim of generalization.
+
+The importable [`grid_phoneme`](grid_phoneme) package now centralizes active GRID paths, the 25 FPS convention, stem normalization, and speaker grouping. Its `split_by_speaker()` utility is intended as the starting point for a speaker-independent split without mixing clips from one speaker across train, validation, and test sets.
+
+## Project hygiene
+
+- `LICENSE`: MIT license for the source code.
+- `tests/`: focused tests for shared GRID contracts and speaker grouping.
+- `.github/workflows/ci.yml`: compiles the repository and runs the tests on pushes and pull requests.
+- `pyproject.toml`: makes `grid_phoneme` an installable package while leaving legacy root scripts compatible.
+- `CONTRIBUTING.md`: development and validation conventions.
+
+The repository name and scripts predate the current focus. The README title deliberately describes the actual task, visual phoneme prediction, rather than talking-head video synthesis.
 
 ## Legacy and retained scripts
 

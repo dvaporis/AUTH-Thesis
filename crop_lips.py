@@ -26,6 +26,7 @@ import urllib.request
 
 import cv2
 import numpy as np
+from grid_phoneme import GRID_LIP_CROP_DIR, GRID_SOURCE_DIR
 
 try:
     import mediapipe as mp
@@ -49,7 +50,7 @@ FACE_LANDMARKER_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
     "face_landmarker/float16/1/face_landmarker.task"
 )
-DEFAULT_MODEL_PATH = Path("s1_lip_crops") / "models" / "face_landmarker.task"
+DEFAULT_MODEL_PATH = GRID_LIP_CROP_DIR / "models" / "face_landmarker.task"
 
 
 @dataclass
@@ -393,9 +394,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """Create the command-line argument parser."""
 
     parser = argparse.ArgumentParser(description="Crop GRID videos around the lip area with MediaPipe Face Landmarker")
-    parser.add_argument("--input-dir", type=str, default="s1", help="Folder containing GRID source videos")
-    parser.add_argument("--output-dir", type=str, default="s1_lip_crops", help="Folder for cropped GRID videos")
-    parser.add_argument("--example-dir", type=str, default="s1_lip_crops/examples", help="Folder for example comparison frames")
+    parser.add_argument("--input-dir", type=str, default=str(GRID_SOURCE_DIR), help="Folder containing GRID source videos")
+    parser.add_argument("--output-dir", type=str, default=str(GRID_LIP_CROP_DIR), help="Folder for cropped GRID videos")
+    parser.add_argument("--example-dir", type=str, default=str(GRID_LIP_CROP_DIR / "examples"), help="Folder for example comparison frames")
     parser.add_argument("--max-videos", type=int, default=None, help="Limit how many videos to process")
     parser.add_argument("--example-frames", type=int, default=4, help="How many comparison frames to save per video")
     parser.add_argument("--crop-margin", type=float, default=0.30, help="Extra padding around the lip bounding box")
