@@ -54,6 +54,25 @@ The confusion matrix shows the phoneme-level behavior on the test set. The TER c
 
 The complete figure collection is in [`Report/figures`](Report/figures), including training curves, gate behavior, augmentation examples, and the ablation plots.
 
+### Subtitle-generation proof of concept
+
+The following short clip is a qualitative proof of concept: the predicted
+phonemes are converted into GRID words and rendered as subtitles using the
+predicted frame timings. For this example, `swwp2n` is decoded as **set white
+with p 2 now**, and the predicted subtitle sequence matches the ground-truth
+sequence word-for-word with matching subtitle boundaries.
+
+<video controls width="640" src="Report/figures/swwp2n_lipcrop_pred_subtitled.mp4"></video>
+
+[Open the predicted-subtitle video](Report/figures/swwp2n_lipcrop_pred_subtitled.mp4) ·
+[Predicted subtitles](Report/figures/swwp2n_lipcrop_pred.srt) ·
+[Ground-truth subtitles](Report/figures/swwp2n_lipcrop_gt.srt)
+
+This is an illustrative single-clip result, not an additional test metric. The
+aggregate word and sentence figures above remain the appropriate quantitative
+evaluation. The published proof-of-concept artifact is kept with the tracked
+report figures so this preview remains available in a clean checkout.
+
 ### Ablation summary
 
 | Variant | Test TER | Test frame accuracy | AUC validation accuracy |
