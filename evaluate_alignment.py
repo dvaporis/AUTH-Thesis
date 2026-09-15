@@ -30,6 +30,8 @@ from train_audio_video_alignment import (
 
 
 def build_alignment_model(audio_ckpt: Path, video_ckpt: Path, device: torch.device) -> AudioVideoAlignmentModel:
+    # Recreate the architecture around the two pretrained encoders before
+    # loading the joint alignment checkpoint.
     audio_model = load_audio_model(audio_ckpt)
     video_model = load_video_model(video_ckpt)
 
@@ -131,7 +133,7 @@ def main() -> None:
     eval_ds = PairedRavdessChunkDataset(pairs)
     loader = torch.utils.data.DataLoader(eval_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
-    # build model and load checkpoint
+    # Build the model and restore the jointly trained alignment weights.
     model = build_alignment_model(audio_ckpt, video_ckpt, device)
     ckpt = torch.load(model_path, map_location=device)
     state = ckpt.get("model_state_dict", ckpt)

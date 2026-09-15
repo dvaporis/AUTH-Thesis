@@ -53,6 +53,7 @@ def _save(fig: plt.Figure, path: Path) -> None:
 
 def plot_viseme_history(history: Dict[str, Any], output_dir: Path) -> None:
     """Plot the metrics saved by train_lip_viseme.py."""
+    # Older histories may not contain every auxiliary-loss series.
     output_dir.mkdir(parents=True, exist_ok=True)
 
     train_total = history.get("train_total", [])

@@ -63,6 +63,8 @@ def find_clip_dirs(root: Path, min_frames: int = FRAMES_PER_CLIP) -> List[Path]:
     This will return either a directory Path (containing image frames) or a
     video file Path (e.g., .mp4) if the file has >= min_frames frames.
     """
+    # Accept both extracted image-frame directories and video files because
+    # the alignment experiments use both representations.
     clips: List[Path] = []
     root = Path(root)
     if not root.exists():
@@ -110,6 +112,8 @@ class VideoFrameOrderDataset(Dataset):
     """
 
     def __init__(self, root: Path, frames_per_clip: int = FRAMES_PER_CLIP, transforms_new=None, clip_dirs: Optional[List[Path]] = None):
+        # Enumerate sliding windows once so training and validation share the
+        # same ordered-versus-shuffled sample construction.
         self.root = Path(root)
         self.frames_per_clip = int(frames_per_clip)
         # either use provided clip_dirs (filtered) or discover under root

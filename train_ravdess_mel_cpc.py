@@ -97,6 +97,8 @@ class MelChunkDataset(torch.utils.data.Dataset):
         return len(self.files)
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+        # Normalize each chunk independently, then expose overlapping temporal
+        # slices for the CPC encoder and future-step predictor.
         mel_path = self.files[index]
         with np.load(mel_path) as data:
             mel = data["mel"].astype(np.float32)

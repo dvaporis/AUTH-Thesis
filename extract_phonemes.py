@@ -273,6 +273,8 @@ def forced_align_phonemes(
     sample_rate: int = TARGET_SR,
     hop_length_samples: int = 320,   # wav2vec2 feature stride: 20 ms at 16 kHz
 ) -> List[PhonemeSpan]:
+    # wav2vec2 supplies acoustic evidence; the later alignment pass maps it
+    # back to the canonical GRID phoneme sequence.
     """Run CTC forced alignment using torchaudio.functional.forced_align.
 
     Returns a list of PhonemeSpan with timing in seconds.

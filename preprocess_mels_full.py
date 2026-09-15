@@ -57,6 +57,8 @@ def resolve_ffmpeg_executable():
 
 
 def load_audio(path: Path, sr: int):
+    # The backend chain supports both standalone audio files and audio streams
+    # embedded in the legacy video dataset.
     ext = path.suffix.lower()
     av_mod = try_import('av')
     if av_mod is not None:

@@ -18,6 +18,8 @@ from train_lip_lstm import VisualLSTMFrameCE, DEFAULT_BLANK_TOKEN
 
 def load_video_frames(video_path: Path, frame_size: int = 224) -> torch.Tensor:
     """Loads video and prepares it exactly like the validation transform."""
+    # Keeping preprocessing identical to training makes frame boundaries from
+    # the later Viterbi pass comparable to the model's learned timestamps.
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise RuntimeError(f"Cannot open video file: {video_path}")
@@ -81,7 +83,8 @@ def viterbi_forced_alignment(
     if num_states > 1:
         trellis[0, 1] = log_probs[0, states[1]]
 
-    # Forward dynamic programming pass
+    # Forward dynamic programming pass: retain the best predecessor for every
+    # CTC state at every video frame.
     for t in range(1, num_frames):
         for s in range(num_states):
             current_token = states[s]

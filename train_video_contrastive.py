@@ -87,6 +87,8 @@ class VideoAugmentation:
 
     def augment(self, clip: torch.Tensor) -> torch.Tensor:
         """Apply exactly one augmentation to a clip [C, T, H, W]."""
+        # One transform creates the positive view; all other clips in the batch
+        # act as negatives for the contrastive objective.
         augmentation_methods = [
             ("rotation", self._augment_rotation),
             ("horizontal_flip", self._augment_horizontal_flip),

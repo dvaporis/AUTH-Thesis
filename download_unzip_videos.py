@@ -13,6 +13,8 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 api = KaggleApi()
 api.authenticate()
 
+# Download only the selected video stream; each Kaggle file is returned as a
+# zip archive and is extracted into the local staging directory below.
 # Match files starting with 01 and ending with .mp4
 pattern = re.compile(r"^01.*\.mp4$")
 

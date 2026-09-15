@@ -375,6 +375,7 @@ def load_phoneme_csv(csv_path: Path, fps: float = 25.0) -> Dict[str, AlignedReco
 # ---------------------------------------------------------------------------
 
 def build_vocab(samples: Sequence[Sample], min_count: int = 2) -> List[str]:
+    # Rare labels are remapped within their viseme class to stabilise training.
     """
     Build sorted phoneme vocabulary from training samples.
     Phonemes appearing fewer than `min_count` times are merged into their

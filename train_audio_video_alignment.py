@@ -91,6 +91,8 @@ class PairedRavdessChunkDataset(Dataset):
         return len(self.pairs)
 
     def _load_audio_slices(self, audio_path: Path) -> torch.Tensor:
+        # Convert each 128x50 mel chunk into 25 short windows to match the
+        # temporal resolution of the video token sequence.
         with np.load(audio_path) as data:
             mel = data["mel"].astype(np.float32)
 

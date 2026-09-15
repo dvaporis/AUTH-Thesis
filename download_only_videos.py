@@ -2,6 +2,8 @@ import kagglehub
 import os
 import shutil
 
+# This legacy helper keeps only the dataset's video files matching the agreed
+# filename prefix, avoiding the muted alternate video stream.
 # 1. Download the dataset (this gets the local path where it's cached)
 dataset_path = kagglehub.dataset_download("thbdh5765/audio-visual-database-of-emotional-speech-and-song")
 

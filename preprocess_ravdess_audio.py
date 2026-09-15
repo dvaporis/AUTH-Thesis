@@ -57,6 +57,8 @@ def resolve_ffmpeg_executable():
 
 
 def load_audio(path: Path, sr: int):
+    # Decode the container, convert to mono, and resample before chunking so
+    # every saved mel tensor has the same temporal convention.
     ext = path.suffix.lower()
     # Prefer PyAV (same approach as test_mel_reconstruction.py)
     av_mod = try_import('av')

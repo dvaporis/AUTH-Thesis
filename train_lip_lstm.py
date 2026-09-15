@@ -116,6 +116,8 @@ def normalize_frame_token(token: Optional[str]) -> str:
 
 
 def load_aligned_phoneme_targets(csv_path: Path) -> Dict[str, AlignedPhonemeRecord]:
+    # The aligned CSV is the training contract: labels are matched to videos
+    # later by their normalized GRID stem.
     if not csv_path.exists():
         raise FileNotFoundError(f"Phoneme CSV not found: {csv_path}")
 

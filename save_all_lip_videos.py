@@ -1,12 +1,12 @@
 """
-Save all RAVDESS videos as reduced lip-only videos.
+Save all GRID videos as reduced lip-only videos.
 
-This script reuses the MediaPipe lip-cropping pipeline from crop_ravdess_lips.py
+This script reuses the MediaPipe lip-cropping pipeline from crop_lips.py
 and runs it over the full input folder by default.
 
 Usage:
     python save_all_lip_videos.py
-    python save_all_lip_videos.py --input-dir ravdess_videos_only --output-dir lip_crop_results_full
+    python save_all_lip_videos.py --input-dir s1 --output-dir s1_lip_crops
 """
 
 from __future__ import annotations
@@ -15,11 +15,11 @@ import argparse
 import logging
 from pathlib import Path
 
-from crop_ravdess_lips import (
+from crop_lips import (
     DEFAULT_MODEL_PATH,
     build_face_landmarker,
     ensure_face_landmarker_model,
-    process_ravdess_folder,
+    process_video_folder,
     require_mediapipe,
 )
 
@@ -31,9 +31,9 @@ logger = logging.getLogger(__name__)
 def build_arg_parser() -> argparse.ArgumentParser:
     """Create command-line arguments for full lip-only video export."""
 
-    parser = argparse.ArgumentParser(description="Save all videos as reduced lip-only versions")
-    parser.add_argument("--input-dir", type=str, default="ravdess_videos_only", help="Folder containing source videos")
-    parser.add_argument("--output-dir", type=str, default="lip_crop_results_full", help="Folder where lip-only videos will be saved")
+    parser = argparse.ArgumentParser(description="Save all GRID videos as reduced lip-only versions")
+    parser.add_argument("--input-dir", type=str, default="s1", help="Folder containing GRID source videos")
+    parser.add_argument("--output-dir", type=str, default="s1_lip_crops", help="Folder where lip-only videos will be saved")
     parser.add_argument("--crop-margin", type=float, default=0.30, help="Padding around detected lip landmarks")
     parser.add_argument("--crop-size", type=int, default=224, help="Output lip crop size in pixels; use 0 for native crop size")
     return parser
@@ -58,7 +58,7 @@ def main() -> None:
     landmarker = build_face_landmarker(model_path)
 
     try:
-        results = process_ravdess_folder(
+        results = process_video_folder(
             input_dir=input_dir,
             output_dir=output_dir,
             example_dir=example_dir,

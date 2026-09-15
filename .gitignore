@@ -32,7 +32,7 @@ ravdess_mel_cpc_results/
 video_frame_order_results/
 video_conditioned_mel_diffusion_results/
 video_conditioned_mel_diffusion_eval/
-visual_lstm_ctc_results
+visual_lstm_ctc_results/
 visual_lstm_ce_results/
 phonemes_s1_aligned/
 decode_results/

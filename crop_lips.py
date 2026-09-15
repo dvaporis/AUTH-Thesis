@@ -1,17 +1,17 @@
 """
-Crop RAVDESS videos around the lip region using MediaPipe Face Mesh.
+Crop GRID videos around the lip region using MediaPipe Face Landmarker.
 
 This script:
-1. Scans the ravdess_videos_only folder for video files
+1. Scans the GRID ``s1`` folder for video files
 2. Uses MediaPipe Face Mesh to locate the lip region in each frame
 3. Crops a padded mouth/lip bounding box to reduce frame size
 4. Saves cropped videos for later training use
 5. Saves a few example comparison frames so you can inspect the crops
 
 Usage:
-    python crop_ravdess_lips.py
-    python crop_ravdess_lips.py --input-dir ravdess_videos_only --max-videos 3
-    python crop_ravdess_lips.py --save-cropped-video
+    python crop_lips.py
+    python crop_lips.py --input-dir s1 --max-videos 3
+    python crop_lips.py --no-cropped-video
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ FACE_LANDMARKER_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
     "face_landmarker/float16/1/face_landmarker.task"
 )
-DEFAULT_MODEL_PATH = Path("lip_crop_results") / "models" / "face_landmarker.task"
+DEFAULT_MODEL_PATH = Path("s1_lip_crops") / "models" / "face_landmarker.task"
 
 
 @dataclass
@@ -104,8 +104,8 @@ def build_face_landmarker(model_path: Path):
     return vision.FaceLandmarker.create_from_options(options)
 
 
-def find_ravdess_video_files(input_dir: Path) -> List[Path]:
-    """Find video files under the RAVDESS video folder."""
+def find_video_files(input_dir: Path) -> List[Path]:
+    """Find supported video files recursively under a dataset directory."""
 
     if not input_dir.exists():
         logger.warning("Input directory does not exist: %s", input_dir)
@@ -339,7 +339,7 @@ def process_video_lip_crops(
     )
 
 
-def process_ravdess_folder(
+def process_video_folder(
     input_dir: Path,
     output_dir: Path,
     example_dir: Path,
@@ -350,9 +350,9 @@ def process_ravdess_folder(
     crop_margin: float = 0.30,
     crop_output_size: Optional[int] = 224,
 ) -> List[LipCropResult]:
-    """Process all videos in the RAVDESS folder."""
+    """Process all videos in a dataset folder using one landmarker instance."""
 
-    video_files = find_ravdess_video_files(input_dir)
+    video_files = find_video_files(input_dir)
     if max_videos is not None:
         video_files = video_files[:max_videos]
 
@@ -392,10 +392,10 @@ def process_ravdess_folder(
 def build_arg_parser() -> argparse.ArgumentParser:
     """Create the command-line argument parser."""
 
-    parser = argparse.ArgumentParser(description="Crop RAVDESS videos around the lip area with MediaPipe Face Mesh")
-    parser.add_argument("--input-dir", type=str, default="ravdess_videos_only", help="Folder containing source videos")
-    parser.add_argument("--output-dir", type=str, default="lip_crop_results", help="Folder for cropped videos")
-    parser.add_argument("--example-dir", type=str, default="lip_crop_results/examples", help="Folder for example comparison frames")
+    parser = argparse.ArgumentParser(description="Crop GRID videos around the lip area with MediaPipe Face Landmarker")
+    parser.add_argument("--input-dir", type=str, default="s1", help="Folder containing GRID source videos")
+    parser.add_argument("--output-dir", type=str, default="s1_lip_crops", help="Folder for cropped GRID videos")
+    parser.add_argument("--example-dir", type=str, default="s1_lip_crops/examples", help="Folder for example comparison frames")
     parser.add_argument("--max-videos", type=int, default=None, help="Limit how many videos to process")
     parser.add_argument("--example-frames", type=int, default=4, help="How many comparison frames to save per video")
     parser.add_argument("--crop-margin", type=float, default=0.30, help="Extra padding around the lip bounding box")
@@ -420,7 +420,7 @@ def main() -> None:
     landmarker = build_face_landmarker(model_path)
 
     try:
-        results = process_ravdess_folder(
+        results = process_video_folder(
             input_dir=input_dir,
             output_dir=output_dir,
             example_dir=example_dir,

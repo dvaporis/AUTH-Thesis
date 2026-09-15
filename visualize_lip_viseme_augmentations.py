@@ -204,6 +204,7 @@ def build_showcase(
     frame_size: int = 96,
     num_tiles: int = 4,
 ) -> List[Path]:
+    # Show the same three augmentations used by LipDataset after normalisation.
     rng = random.Random(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)

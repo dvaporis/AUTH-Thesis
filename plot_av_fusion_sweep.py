@@ -81,6 +81,7 @@ SUMMARY_METRICS: List[Tuple[str, str, bool]] = [
 # ---------------------------------------------------------------------------
 
 def load_summary_rows(paths: Sequence[Path]) -> List[Dict[str, Any]]:
+    # Accept several summaries so AV, audio-only, and video-only runs compare.
     rows: List[Dict[str, Any]] = []
     for path in paths:
         with path.open("r", encoding="utf-8") as fh:

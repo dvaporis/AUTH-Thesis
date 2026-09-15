@@ -57,6 +57,8 @@ class MelDataset(Dataset):
         return mel
 
     def __getitem__(self, idx: int):
+        # Diffusion samples use a fixed time axis; shorter clips are padded and
+        # longer clips are truncated before conditioning is attached.
         mel_path = self.files[idx]
         stem = mel_path.stem
         mel = self._load_mel(mel_path)

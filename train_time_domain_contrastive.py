@@ -84,6 +84,8 @@ class AudioAugmentation:
 
         The returned tensor is a float32 waveform of length `config.num_samples`.
         """
+        # Contrastive positives differ by one controlled waveform transform;
+        # padding/truncation keeps every batch tensor rectangular.
         methods = [
             self._augment_gaussian,
             self._augment_brown,

@@ -281,6 +281,7 @@ def main() -> None:
     rows = read_manifest_rows(noise_manifest_path)
     log.info("Loaded %d row(s) from %s", len(rows), noise_manifest_path)
 
+    # A dry run exercises one row before a full cache is generated.
     if args.dry_run:
         rows = rows[:1]
     elif args.max_files > 0:

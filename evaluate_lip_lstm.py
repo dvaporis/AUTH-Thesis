@@ -58,6 +58,7 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+# These settings affect only the diagnostic audio examples made after scoring.
 DEFAULT_BLANK_TOKEN = "<blank>"
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv"}
 SAMPLE_RATE = 22050          # output WAV sample rate
@@ -277,6 +278,7 @@ def load_aligned_phoneme_targets(csv_path: Path) -> Dict[str, List[str]]:
 
 
 def build_test_samples(video_dir: Path, phoneme_csv: Path, seed: int, test_ratio: float = 0.2) -> List[Sample]:
+    # Match both modalities through the shared GRID filename stem.
     targets = load_aligned_phoneme_targets(phoneme_csv)
     all_samples: List[Sample] = []
     for vp in find_lip_videos(video_dir):

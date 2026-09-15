@@ -5,6 +5,7 @@ Diagnose CUDA availability and PyTorch setup.
 import torch
 import sys
 
+# This script reports the installed PyTorch/CUDA state before any training run.
 print("="*60)
 print("PYTORCH CUDA DIAGNOSTICS")
 print("="*60)

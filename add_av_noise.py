@@ -121,6 +121,7 @@ def find_lip_videos(video_dir: Path) -> List[Path]:
 
 
 def build_audio_source_index(audio_source_dir: Path) -> Dict[str, Path]:
+    # Index once so every lip crop can be paired by stem without rescanning.
     index: Dict[str, Path] = {}
     for p in audio_source_dir.rglob("*"):
         if p.is_file() and p.suffix.lower() in AUDIO_OR_AV_EXTS:

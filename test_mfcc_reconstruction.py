@@ -41,6 +41,8 @@ class MFCCConfig:
     num_frames: int = 1 + (num_samples) // hop_length 
 
 def extract_audio_from_video(video_path: Path, target_sr: int = 16000) -> Tuple[Optional[np.ndarray], int]:
+    # Reconstruction is evaluated on a fixed-rate mono waveform, independent
+    # of the source video's original audio format.
     try:
         container = av.open(str(video_path))
         audio_stream = container.streams.audio[0] if container.streams.audio else None

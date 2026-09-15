@@ -131,6 +131,8 @@ def get_full_audio_clip(audio: np.ndarray, sr: int, max_duration: Optional[float
 
 
 def load_hifigan_model(config_file: Path, checkpoint_file: Path, device: torch.device) -> tuple[Generator, AttrDict]:
+    # HiFi-GAN consumes the same mel convention used by this reconstruction
+    # test, so the model and config must be loaded as a matched pair.
     if not config_file.exists():
         raise FileNotFoundError(f"HiFi-GAN config not found: {config_file}")
     if not checkpoint_file.exists():

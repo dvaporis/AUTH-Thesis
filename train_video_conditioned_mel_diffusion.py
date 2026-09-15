@@ -109,6 +109,8 @@ class PairedMelVideoChunkDataset(Dataset):
         return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
     def _load_video_chunk(self, video_path: Path, chunk_idx: int) -> torch.Tensor:
+        # Sample a fixed number of frames from the time interval represented by
+        # one mel chunk so the conditioning sequence has stable dimensions.
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             cap.release()

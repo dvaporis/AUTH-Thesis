@@ -64,6 +64,7 @@ def read_json(path: Path) -> Dict[str, Any]:
 
 
 def build_run_plan(base_noise_dir: Path, base_result_dir: Path, video_obstruct_frames_values: Sequence[int], modality: str) -> List[VideoRun]:
+    # Build paths up front so each sweep run is independent and resumable.
     plan: List[VideoRun] = []
     for video_obstruct_frames in video_obstruct_frames_values:
         tag = f"{format_video_tag(video_obstruct_frames)}_{modality}"

@@ -138,6 +138,8 @@ class AudioAugmentation:
         return mfcc_masked
     
     def augment(self, audio: np.ndarray, sr: int) -> Tuple[np.ndarray, torch.Tensor]:
+        # Generate one positive view per source chunk; the batch supplies the
+        # remaining negatives for NT-Xent.
         """
         Apply exactly ONE augmentation to raw audio and extract MFCC.
         

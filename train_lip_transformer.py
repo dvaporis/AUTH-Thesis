@@ -55,6 +55,10 @@ class TransformerConfig:
     feedforward_multiplier: int = 4
 
 
+# This variant deliberately reuses the LSTM pipeline's CSV parsing, splits,
+# diagnostics, and loaders so only the temporal encoder changes.
+
+
 class SinusoidalPositionalEncoding(nn.Module):
     def __init__(self, hidden_dim: int, dropout: float = 0.1):
         super().__init__()

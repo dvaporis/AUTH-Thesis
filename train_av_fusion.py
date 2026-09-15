@@ -319,6 +319,7 @@ def load_noise_manifest(csv_path: Path) -> Dict[str, NoiseRecord]:
 
 
 def build_samples(phoneme_csv: Path, noise_manifest: Path, fps: float = 25.0) -> List[Sample]:
+    # Join phoneme targets and corrupted media using their shared GRID stem.
     phoneme_records = load_phoneme_csv(phoneme_csv, fps=fps)
     noise_records = load_noise_manifest(noise_manifest)
 

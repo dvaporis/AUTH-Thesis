@@ -95,6 +95,8 @@ def load_diffusion_bundle(
     beta_start_override: Optional[float] = None,
     beta_end_override: Optional[float] = None,
 ) -> Tuple[MelConditionedUNet, VideoConditionEncoder, GaussianDiffusion]:
+    # Rebuild both learned components from the checkpoint before sampling; the
+    # diffusion schedule is restored from saved training arguments when present.
     if not diffusion_checkpoint.exists():
         raise FileNotFoundError(f"Diffusion checkpoint not found: {diffusion_checkpoint}")
 

@@ -60,6 +60,7 @@ def resolve_ffmpeg_executable() -> Optional[str]:
 
 
 def load_audio(path: Path, sr: int):
+    # Try native/container decoders first, then fall back to ffmpeg for video.
     ext = path.suffix.lower()
 
     av_mod = try_import("av")

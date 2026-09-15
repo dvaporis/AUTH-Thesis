@@ -136,6 +136,8 @@ def parse_grid_stem(stem: str) -> Optional[List[str]]:
     Examples: bbaf2n → bin blue at f 2 now
               prwz9p → place red with z 9 please
     """
+    # Decode the filename grammar so phoneme errors can be reported against
+    # the known six-word GRID sentence, not only against token sequences.
     s = stem.lower().strip()
     s = re.sub(r"^s\d+_", "", s)      # strip speaker prefix  s1_...
     s = s.replace("_lipcrop", "")     # strip lipcrop suffix

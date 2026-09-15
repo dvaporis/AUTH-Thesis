@@ -55,6 +55,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+# These labels determine which phoneme confusions receive partial credit.
 VIDEO_EXTS   = {".mp4", ".avi", ".mov", ".mkv"}
 BLANK_TOKEN  = "<blank>"
 MISSING_TOKEN    = "<missed>"
@@ -711,6 +712,7 @@ def find_videos(video_dir: Path) -> Dict[str, Path]:
 
 
 def build_all_samples(video_dir: Path, phoneme_csv: Path) -> List[Sample]:
+    # The CSV supplies targets; video files provide the matching visual input.
     records   = load_phoneme_csv(phoneme_csv)
     video_map = find_videos(video_dir)
     samples   = []

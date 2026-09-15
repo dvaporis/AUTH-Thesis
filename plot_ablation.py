@@ -78,6 +78,7 @@ def _save(fig: plt.Figure, path: Path) -> None:
 
 
 def plot_all(results: List[Dict[str, Any]], output_dir: Path) -> None:
+    # Plotting is deliberately JSON-only and does not require checkpoints.
     output_dir.mkdir(parents=True, exist_ok=True)
     labels = [r["label"] for r in results]
     colors = COLORS[:len(results)]

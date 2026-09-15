@@ -26,6 +26,7 @@ def download_audio_visual_dataset(cache_dir: str = "kaggle_datasets") -> Path:
     Returns:
         Path to the downloaded dataset
     """
+    # Keep Kaggle's cache isolated from the repository's processed datasets.
     dataset_name = "thbdh5765/audio-visual-database-of-emotional-speech-and-song"
     
     logger.info(f"Downloading dataset: {dataset_name}")

@@ -71,6 +71,7 @@ def collapse_ctc(tokens):
     Collapse repeats and remove blanks.
     Returns list of (token, start_frame, end_frame)
     """
+    # Preserve frame boundaries while applying standard CTC repeat/blank rules.
     collapsed = []
     prev = None
     start = None

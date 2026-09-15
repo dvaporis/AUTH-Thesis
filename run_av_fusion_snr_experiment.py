@@ -64,6 +64,7 @@ def read_json(path: Path) -> Dict[str, Any]:
 
 
 def build_run_plan(base_noise_dir: Path, base_result_dir: Path, snr_values: Sequence[float], modality: str) -> List[SNRRun]:
+    # Build paths up front so each sweep run is independent and resumable.
     plan: List[SNRRun] = []
     for snr_db in snr_values:
         tag = f"{format_snr_tag(snr_db)}_{modality}"
