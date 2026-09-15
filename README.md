@@ -62,9 +62,9 @@ predicted frame timings. For this example, `swwp2n` is decoded as **set white
 with p 2 now**, and the predicted subtitle sequence matches the ground-truth
 sequence word-for-word with matching subtitle boundaries.
 
-<video controls width="640" src="Report/figures/swwp2n_lipcrop_pred_subtitled.mp4"></video>
+![Subtitle-generation proof of concept](Report/figures/swwp2n_lipcrop_pred_subtitled.gif)
 
-[Open the predicted-subtitle video](Report/figures/swwp2n_lipcrop_pred_subtitled.mp4) ·
+[Open the original predicted-subtitle video](Report/figures/swwp2n_lipcrop_pred_subtitled.mp4) ·
 [Predicted subtitles](Report/figures/swwp2n_lipcrop_pred.srt) ·
 [Ground-truth subtitles](Report/figures/swwp2n_lipcrop_gt.srt)
 
