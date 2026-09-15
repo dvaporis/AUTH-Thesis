@@ -1,0 +1,62 @@
+[
+  {
+    "name": "1_bilstm_full_loss",
+    "label": "BiLSTM + Full Loss",
+    "epochs_run": 40,
+    "best_val_ter": 0.1251388374676046,
+    "auc_val_acc": 0.784010551647538,
+    "test_ter": 0.12190616919098633,
+    "test_loss": 1.0040546357631683,
+    "test_frame_acc": 0.847427096168515
+  },
+  {
+    "name": "2_transformer_full_loss",
+    "label": "Transformer + Full Loss",
+    "epochs_run": 40,
+    "best_val_ter": 0.15512773047019623,
+    "auc_val_acc": 0.7176138467234356,
+    "test_ter": 0.15663095677872182,
+    "test_loss": 1.095961620933131,
+    "test_frame_acc": 0.8394455201549024
+  },
+  {
+    "name": "3_no_seq_encoder",
+    "label": "No Seq. Encoder (Proj. Only)",
+    "epochs_run": 40,
+    "best_val_ter": 0.2539800074046649,
+    "auc_val_acc": 0.6005507219548316,
+    "test_ter": 0.24639822681935722,
+    "test_loss": 1.3108222390476025,
+    "test_frame_acc": 0.8122452033092766
+  },
+  {
+    "name": "4_bilstm_ctc_only",
+    "label": "BiLSTM + CTC Only",
+    "epochs_run": 40,
+    "best_val_ter": 0.19770455386893743,
+    "auc_val_acc": 0.6005368382080709,
+    "test_ter": 0.18692279275951237,
+    "test_loss": 0.19358009550916522,
+    "test_frame_acc": 0.4742947251070821
+  },
+  {
+    "name": "5_bilstm_framece_only",
+    "label": "BiLSTM + Frame-CE Only",
+    "epochs_run": 40,
+    "best_val_ter": 0.1554979637171418,
+    "auc_val_acc": 0.7401564235468345,
+    "test_ter": 0.14185445142223865,
+    "test_loss": 0.8729725982013502,
+    "test_frame_acc": 0.8400563281112481
+  },
+  {
+    "name": "6_bilstm_hard_targets",
+    "label": "BiLSTM + Hard Targets (No Similarity)",
+    "epochs_run": 40,
+    "best_val_ter": 0.1266197704553869,
+    "auc_val_acc": 0.7696269900037023,
+    "test_ter": 0.12892500923531586,
+    "test_loss": 0.6820071496461567,
+    "test_frame_acc": 0.8455814703984039
+  }
+]

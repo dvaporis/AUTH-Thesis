@@ -237,6 +237,9 @@ def similarity_matrix_to_soft_targets(sim: torch.Tensor) -> torch.Tensor:
         dist[i, i] = 0.85
         if total > 0:
             dist[i] += 0.15 * (neighbour / total)
+        else:
+            # Keep every row a probability distribution without a usable neighbour.
+            dist[i, i] = 1.0
 
     return dist
 

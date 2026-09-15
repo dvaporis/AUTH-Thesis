@@ -26,7 +26,7 @@ python ablation_experiment.py \
     --output-dir ablation_results
 ```
 
-The tracked presentation figure is [`Report/figures/ablation_val_ter.png`](../Report/figures/ablation_val_ter.png). The numerical table in the README is transcribed from the historical run output; the JSON source is generated under `ablation_results/` and is ignored by Git.
+The tracked presentation figure is [`Report/figures/ablation_val_ter.png`](../Report/figures/ablation_val_ter.png). The numerical table in the README is sourced from the tracked [`Report/ablation_summary.json`](../Report/ablation_summary.json), copied from the historical ablation output. The generated `ablation_results/` directory remains ignored.
 
 The ablation uses single runs, so small differences should not be treated as statistically established. The BiLSTM full-loss baseline has test TER 0.1219 versus 0.1289 for hard targets and 0.1419 for frame-CE only. Those margins are modest and may be affected by seed variance. The clearer result is the sequence-encoder ablation: the BiLSTM baseline at 0.1219 is substantially better than the projection-only variant at 0.2464.
 

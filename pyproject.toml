@@ -9,9 +9,30 @@ description = "Utilities for the GRID visual phoneme prediction pipeline"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
 license = { file = "LICENSE" }
+dependencies = [
+	"torch==2.10.0",
+	"torchvision==0.25.0",
+	"torchaudio==2.10.0",
+	"numpy==2.4.2",
+	"scipy==1.17.1",
+	"librosa==0.11.0",
+	"soundfile==0.13.1",
+	"av==16.1.0",
+	"opencv-contrib-python-headless==4.13.0.92",
+	"mediapipe==0.10.35",
+	"Pillow==12.1.1",
+	"matplotlib==3.10.8",
+	"tqdm==4.67.3",
+	"transformers==5.2.0",
+	"huggingface-hub==1.5.0",
+]
+
+[project.urls]
+Repository = "https://github.com/dvaporis/Talking-Heads"
 
 [tool.setuptools.packages.find]
 include = ["grid_phoneme*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]

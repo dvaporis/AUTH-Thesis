@@ -1,6 +1,6 @@
 # GRID Visual Phoneme Prediction
 
-[![CI](https://github.com/dvapo/AUTH-Thesis/actions/workflows/ci.yml/badge.svg)](https://github.com/dvapo/AUTH-Thesis/actions/workflows/ci.yml)
+[![CI](https://github.com/dvaporis/Talking-Heads/actions/workflows/ci.yml/badge.svg)](https://github.com/dvaporis/Talking-Heads/actions/workflows/ci.yml)
 
 This repository develops a **GRID-based visual phoneme prediction pipeline**: lip-crop video is converted into frame-aligned phoneme predictions, then decoded into words with GRID grammar. An optional audio-visual model studies robustness to controlled audio and video corruption.
 
@@ -23,7 +23,7 @@ The reported evaluation uses the known GRID vocabulary and sentence grammar, so 
 | Word-correct prediction rate | **87.1%** | Main constrained test evaluation. |
 | Exact sentence match | **38.0%** | Main constrained test evaluation. |
 | Main-run phoneme TER | **12.41%** | Separate constrained visual evaluation run. |
-| Best ablation frame accuracy | **84.74%** | BiLSTM full-loss baseline, before sequence collapse. |
+| Best ablation frame accuracy | **84.74%** | BiLSTM full-loss baseline, before collapsing repeated frame labels into a sequence. |
 
 ### Figures
 
@@ -83,7 +83,7 @@ The active entry points are `crop_lips.py`, `save_all_lip_videos.py`, `extract_p
 
 ## Installation and usage
 
-The active pipeline was tested on Python 3.14.0; the package metadata supports Python 3.11 through 3.14. Install pinned active dependencies with:
+The active pipeline was tested on Python 3.14.0; the package metadata supports Python 3.11 through 3.14. Python 3.11 is shown below for broadest wheel availability. Install pinned active dependencies with:
 
 ```bash
 python3.11 -m venv .venv

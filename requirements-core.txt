@@ -8,7 +8,7 @@ scipy==1.17.1
 librosa==0.11.0
 soundfile==0.13.1
 av==16.1.0
-opencv-contrib-python==4.13.0.92
+opencv-contrib-python-headless==4.13.0.92
 mediapipe==0.10.35
 Pillow==12.1.1
 matplotlib==3.10.8
