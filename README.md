@@ -116,11 +116,11 @@ Generated datasets, checkpoints, manifests, and plots are kept in result directo
 
 ## Requirements
 
-The project is written for Python 3. The active environment is intentionally separated from the historical experiment environment:
+The active pipeline was tested on **Python 3.14.0**. The active environment is intentionally separated from the historical experiment environment:
 
 - [`requirements-core.txt`](requirements-core.txt) contains pinned dependencies for the active GRID pipeline.
 - [`requirements-dev.txt`](requirements-dev.txt) adds the test runner.
-- [`requirements-legacy.txt`](requirements-legacy.txt) preserves the broad, unpinned historical stack for RAVDESS, EnCodec, diffusion, and contrastive experiments.
+- [`requirements-legacy.txt`](requirements-legacy.txt) preserves the broad historical package-name list for RAVDESS, EnCodec, diffusion, and contrastive experiments. It is not a lockfile because the original legacy environment was not preserved.
 - [`requirements.txt`](requirements.txt) is the default entry point and includes only the core requirements.
 
 The core pins are based on the tested development environment. PyTorch CUDA wheels can be platform-specific; if the standard PyPI install is not appropriate for your GPU, install a matching PyTorch build first and then install the remaining core dependencies.
@@ -153,11 +153,15 @@ For tests and development checks:
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 ```
 
-To reproduce a legacy experiment, install the additional historical stack only when needed:
+To run a legacy experiment, create a **separate** virtual environment and install the additional historical stack only when needed. Do not install it into the active core environment, because it re-lists overlapping packages such as PyTorch, NumPy, Transformers, and librosa without historical version pins:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements-legacy.txt
+py -3.14 -m venv .venv-legacy
+.\.venv-legacy\Scripts\Activate.ps1
+python -m pip install -r requirements-legacy.txt
 ```
+
+This legacy file records dependency names for provenance, not a guaranteed reproduction of the original runs. Exact legacy reproducibility would require the original environment export or a separately archived container.
 
 ### External tools
 
@@ -414,6 +418,7 @@ The variants compare the baseline BiLSTM, Transformer and projection-only sequen
 - Use `--seed` where available when comparing runs.
 - Use `--num-workers 0` on Windows if DataLoader worker startup causes problems.
 - Cached mel files are valid only for the same FPS, sample rate, FFT, mel-bin, and hop-length settings used during training.
+- The active phoneme extractor was checked with Transformers 5.2.0 and Hugging Face Hub 1.5.0: the `Wav2Vec2FeatureExtractor`, `Wav2Vec2ForCTC`, and `Wav2Vec2CTCTokenizer` APIs import successfully, and `extract_phonemes.py --help` runs under those pins. A full extraction still requires model download, eSpeak-NG, and usable GRID media.
 
 ## Generalization and evaluation scope
 

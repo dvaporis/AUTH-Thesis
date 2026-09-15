@@ -1,5 +1,9 @@
-# Historical environment for retained RAVDESS and exploratory experiments.
-# Prefer requirements-core.txt for the active GRID phoneme pipeline.
+# Historical dependency names for retained RAVDESS and exploratory experiments.
+# This is not a reproducible lockfile: the original legacy environment was not
+# preserved, so its exact historical versions cannot be reconstructed here.
+# Install into a separate virtual environment; do not combine with
+# requirements-core.txt. Prefer requirements-core.txt for the active GRID
+# phoneme pipeline.
 absl-py
 accelerate
 annotated-doc
